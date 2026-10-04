@@ -432,3 +432,45 @@ func TestExec(t *testing.T) {
 		}
 	}
 }
+
+func TestUse(t *testing.T) {
+	e := newEnv(t)
+	e.ok("add", e.kubeconfig("a.yaml", "https://a"), "-c", "acme", "-n", "prod")
+	e.ok("add", e.kubeconfig("b.yaml", "https://b"), "-c", "acme", "-n", "stage")
+	e.ok("off", "acme/stage")
+	backups := func() int {
+		entries, _ := os.ReadDir(filepath.Join(e.home, "backups"))
+		return len(entries)
+	}
+	before := backups()
+
+	if out := e.ok("use"); strings.TrimSpace(out) != "no current context" {
+		t.Errorf("use without current = %q", out)
+	}
+	e.ok("use", "acme/prod")
+	if cfg, _ := clientcmd.LoadFromFile(e.target); cfg.CurrentContext != "acme/prod" {
+		t.Errorf("current-context = %q", cfg.CurrentContext)
+	}
+	if out := e.ok("use"); strings.TrimSpace(out) != "acme/prod" {
+		t.Errorf("use prints %q", out)
+	}
+	if out := e.ok("ls"); !strings.Contains(out, "*  acme    prod") {
+		t.Errorf("ls does not mark the current cluster:\n%s", out)
+	}
+	if backups() != before {
+		t.Error("use wrote a backup")
+	}
+
+	for _, bad := range []string{"acme", "acme/stage", "acme/nope"} {
+		if _, err := e.run("", "use", bad); err == nil {
+			t.Errorf("use %s succeeded", bad)
+		}
+	}
+
+	// Turning the current cluster off clears current-context rather than
+	// leaving kubectl pointed at something else.
+	e.ok("off", "acme/prod")
+	if cfg, _ := clientcmd.LoadFromFile(e.target); cfg.CurrentContext != "" {
+		t.Errorf("current-context = %q after disabling it", cfg.CurrentContext)
+	}
+}

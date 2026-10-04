@@ -41,37 +41,54 @@ func (a *app) bundle(refs []ref) (*api.Config, error) {
 	return out, nil
 }
 
-// exec runs command with KUBECONFIG pointing at a temporary kubeconfig that
-// holds only the given clusters, disabled ones included.
-func (a *app) exec(args, command []string) error {
+// scope writes a temporary kubeconfig holding only the given clusters,
+// disabled ones included. The caller must call cleanup when done with it.
+func (a *app) scope(args []string) (path string, cleanup func(), err error) {
 	refs, err := a.store.expand(args)
 	if err != nil {
-		return err
+		return "", nil, err
 	}
 	cfg, err := a.bundle(refs)
 	if err != nil {
-		return err
+		return "", nil, err
 	}
 	data, err := clientcmd.Write(*cfg)
 	if err != nil {
-		return err
+		return "", nil, err
 	}
 	f, err := os.CreateTemp("", "kx-*.yaml")
 	if err != nil {
-		return err
+		return "", nil, err
 	}
-	defer os.Remove(f.Name())
+	cleanup = func() { os.Remove(f.Name()) }
 	if _, err := f.Write(data); err != nil {
 		f.Close()
-		return err
+		cleanup()
+		return "", nil, err
 	}
 	if err := f.Close(); err != nil {
+		cleanup()
+		return "", nil, err
+	}
+	return f.Name(), cleanup, nil
+}
+
+func scopeEnv(path string, args []string) []string {
+	return append(os.Environ(), "KUBECONFIG="+path, "KX_SCOPE="+strings.Join(args, ","))
+}
+
+// exec runs command with KUBECONFIG pointing at a temporary kubeconfig that
+// holds only the given clusters, disabled ones included.
+func (a *app) exec(args, command []string) error {
+	path, cleanup, err := a.scope(args)
+	if err != nil {
 		return err
 	}
+	defer cleanup()
 
 	cmd := exec.Command(command[0], command[1:]...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = a.stdin, a.stdout, a.stderr
-	cmd.Env = append(os.Environ(), "KUBECONFIG="+f.Name(), "KX_SCOPE="+strings.Join(args, ","))
+	cmd.Env = scopeEnv(path, args)
 	if err := cmd.Start(); err != nil {
 		return err
 	}

@@ -129,36 +129,40 @@ type listRow struct {
 	Context   string `json:"context"`
 	Server    string `json:"server"`
 	Namespace string `json:"namespace"`
+	Version   string `json:"version,omitempty"` // as of the last check
 	Enabled   bool   `json:"enabled"`
 	Current   bool   `json:"current"`
 }
 
-func (a *app) list(client string, asJSON bool) error {
+// rows describes every stored cluster as ls shows it.
+func (a *app) rows() ([]listRow, *state, error) {
 	refs, err := a.store.clusters()
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 	st, err := a.store.loadState()
 	if err != nil {
-		return err
+		return nil, nil, err
 	}
 	cur, err := a.loadTarget()
 	if err != nil {
 		cur = api.NewConfig()
 	}
+	checks, err := a.store.loadChecks()
+	if err != nil {
+		return nil, nil, err
+	}
 	rows := []listRow{}
 	for _, r := range refs {
-		if client != "" && r.client != client {
-			continue
-		}
 		cfg, err := a.store.get(r)
 		if err != nil {
-			return err
+			return nil, nil, err
 		}
 		row := listRow{
 			Client:  r.client,
 			Cluster: r.cluster,
 			Context: r.String(),
+			Version: checks[r.String()].Version,
 			Enabled: st.enabled(r),
 			Current: r.String() == cur.CurrentContext,
 		}
@@ -173,6 +177,20 @@ func (a *app) list(client string, asJSON bool) error {
 			row.Namespace = ctx.Namespace
 		}
 		rows = append(rows, row)
+	}
+	return rows, st, nil
+}
+
+func (a *app) list(client string, asJSON bool) error {
+	all, st, err := a.rows()
+	if err != nil {
+		return err
+	}
+	rows := []listRow{}
+	for _, r := range all {
+		if client == "" || r.Client == client {
+			rows = append(rows, r)
+		}
 	}
 	if client != "" && len(rows) == 0 {
 		return fmt.Errorf("%s: not found", client)
@@ -191,7 +209,7 @@ func (a *app) list(client string, asJSON bool) error {
 	o := newOutput(a.stdout)
 	if !o.tty {
 		// One line per cluster with the client on it, so grep keeps working.
-		cols := []column{{}, {title: "CLIENT"}, {title: "CLUSTER"}, {title: "SERVER"}, {title: "NAMESPACE"}, {title: "STATE"}}
+		cols := []column{{}, {title: "CLIENT"}, {title: "CLUSTER"}, {title: "SERVER"}, {title: "NAMESPACE"}, {title: "VERSION"}, {title: "STATE"}}
 		var out []row
 		for _, r := range rows {
 			mark, state := " ", "on"
@@ -201,12 +219,24 @@ func (a *app) list(client string, asJSON bool) error {
 			if !r.Enabled {
 				state = "off"
 			}
-			out = append(out, row{cells: []cell{{text: mark}, {text: r.Client}, {text: r.Cluster}, {text: r.Server}, {text: r.Namespace}, {text: state}}})
+			out = append(out, row{cells: []cell{{text: mark}, {text: r.Client}, {text: r.Cluster}, {text: r.Server}, {text: r.Namespace}, {text: r.Version}, {text: state}}})
 		}
 		return o.table(cols, out)
 	}
 
-	cols := []column{{}, {title: "CLUSTER", shrink: 12}, {title: "SERVER", shrink: 16, trim: true}, {title: "NAMESPACE", drop: 1}, {title: "STATE"}}
+	known, err := a.store.loadChecks()
+	if err != nil {
+		return err
+	}
+	policy := newVersionPolicy(known)
+	cols := []column{
+		{},
+		{title: "CLUSTER", shrink: 12},
+		{title: "SERVER", shrink: 16, trim: true},
+		{title: "NAMESPACE", drop: 1},
+		{title: "VERSION", drop: 2},
+		{title: "STATE"},
+	}
 	var out []row
 	last := ""
 	for _, r := range rows {
@@ -229,7 +259,11 @@ func (a *app) list(client string, asJSON bool) error {
 		if !r.Enabled {
 			state = cell{"off", o.dim}
 		}
-		out = append(out, row{cells: []cell{mark, name, {r.Server, base}, {r.Namespace, base}, state}})
+		version := o.versionCell(r.Version, policy)
+		if !r.Enabled {
+			version.style = o.dim
+		}
+		out = append(out, row{cells: []cell{mark, name, {r.Server, base}, {r.Namespace, base}, version, state}})
 	}
 	return o.table(cols, out)
 }
@@ -382,6 +416,65 @@ func (a *app) export(args []string) error {
 	}
 	_, err = a.stdout.Write(data)
 	return err
+}
+
+// use sets current-context. Only that field changes, so switching back and
+// forth does not churn the backups the way a rebuild would.
+func (a *app) use(arg string) error {
+	if arg == "" {
+		cfg, err := a.loadTarget()
+		if err != nil {
+			return err
+		}
+		if cfg.CurrentContext == "" {
+			fmt.Fprintln(a.stderr, "no current context")
+			return nil
+		}
+		fmt.Fprintln(a.stdout, cfg.CurrentContext)
+		return nil
+	}
+	r, err := parseRef(arg)
+	if err != nil {
+		return err
+	}
+	if r.cluster == "" {
+		return fmt.Errorf("%s is a client; use takes a cluster: %s/<cluster>", r, r)
+	}
+	if !a.store.exists(r) {
+		return fmt.Errorf("%s: not found", r)
+	}
+	st, err := a.store.loadState()
+	if err != nil {
+		return err
+	}
+	if !st.enabled(r) {
+		return fmt.Errorf("%s is off; turn it on first", r)
+	}
+	cfg, err := a.loadTarget()
+	if err != nil {
+		return err
+	}
+	if cfg.Contexts[r.String()] == nil {
+		// Enabled but missing: the target was edited by hand. Bring it back.
+		if err := a.build(false, nil); err != nil {
+			return err
+		}
+		if cfg, err = a.loadTarget(); err != nil {
+			return err
+		}
+	}
+	if cfg.CurrentContext != r.String() {
+		cfg.CurrentContext = r.String()
+		data, err := clientcmd.Write(*cfg)
+		if err != nil {
+			return err
+		}
+		if err := writeFile(a.target, data); err != nil {
+			return err
+		}
+	}
+	fmt.Fprintf(a.stdout, "using %s\n", r)
+	return nil
 }
 
 func (a *app) pruneState() error {

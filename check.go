@@ -14,7 +14,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -30,13 +29,17 @@ const (
 )
 
 type checkResult struct {
-	Context string     `json:"context"`
-	Status  string     `json:"status"` // ok, unreachable, unauthorized, tls, error
-	Version string     `json:"version,omitempty"`
-	User    string     `json:"user,omitempty"`
-	Expires *time.Time `json:"credentialsExpire,omitempty"`
-	Latency int64      `json:"latencyMs"`
-	Error   string     `json:"error,omitempty"`
+	Context   string     `json:"context"`
+	Status    string     `json:"status"`           // ok, unreachable, unauthorized, tls, error
+	Health    string     `json:"health,omitempty"` // ok, degraded; empty when /readyz is closed
+	Failing   []string   `json:"failing,omitempty"`
+	Version   string     `json:"version,omitempty"`
+	Nodes     *nodeCount `json:"nodes,omitempty"`
+	User      string     `json:"user,omitempty"`
+	Expires   *time.Time `json:"credentialsExpire,omitempty"`
+	Latency   int64      `json:"latencyMs"`
+	Error     string     `json:"error,omitempty"`
+	CheckedAt time.Time  `json:"checkedAt"`
 }
 
 func (a *app) check(ctx context.Context, args []string, all bool, timeout time.Duration, asJSON bool) error {
@@ -61,6 +64,9 @@ func (a *app) check(ctx context.Context, args []string, all bool, timeout time.D
 		})
 	}
 	wg.Wait()
+	if err := a.store.saveChecks(results); err != nil {
+		fmt.Fprintln(a.stderr, "kx: save check results:", err)
+	}
 
 	if asJSON {
 		enc := json.NewEncoder(a.stdout)
@@ -72,7 +78,7 @@ func (a *app) check(ctx context.Context, args []string, all bool, timeout time.D
 		return err
 	}
 	for _, res := range results {
-		if res.Status != "ok" {
+		if res.failed() {
 			return exitError(1)
 		}
 	}
@@ -107,13 +113,20 @@ func (a *app) printCheck(results []checkResult) error {
 		fmt.Fprintln(a.stderr, "nothing to check")
 		return nil
 	}
+	known, err := a.store.loadChecks()
+	if err != nil {
+		return err
+	}
+	policy := newVersionPolicy(known)
 	o := newOutput(a.stdout)
 	now := time.Now()
 	cols := []column{
 		{title: "CLUSTER", shrink: 12},
 		{title: "STATUS"},
-		{title: "VERSION", drop: 2},
-		{title: "USER", shrink: 10, trim: true, drop: 3},
+		{title: "HEALTH"},
+		{title: "VERSION", drop: 4},
+		{title: "NODES", drop: 3},
+		{title: "USER", shrink: 10, trim: true, drop: 2},
 		{title: "EXPIRES"},
 		{title: "LATENCY", drop: 1},
 	}
@@ -135,26 +148,70 @@ func (a *app) printCheck(results []checkResult) error {
 			latency.style = o.warn
 		}
 		rows = append(rows, row{cells: []cell{
-			{r.Context, o.plain}, status, {r.Version, o.plain}, {shortUser(r.User), o.plain}, expires, latency,
+			{r.Context, o.plain}, status, o.healthCell(r), o.versionCell(r.Version, policy),
+			o.nodesCell(r.Nodes), {shortUser(r.User), o.plain}, expires, latency,
 		}})
 	}
 	if err := o.table(cols, rows); err != nil {
 		return err
 	}
-	// Errors go below the table: they are long and would break its layout.
-	for i, r := range results {
-		if r.Error == "" {
-			continue
-		}
-		if i == slices.IndexFunc(results, func(r checkResult) bool { return r.Error != "" }) {
-			fmt.Fprintln(o.w)
-		}
-		fmt.Fprintln(o.w, o.paint(o.bad, r.Context))
-		for _, l := range strings.Split(o.wrapIndented(r.Error, "  "), "\n") {
-			fmt.Fprintln(o.w, o.paint(o.dim, l))
+	// Problems go below the table: they are long and would break its layout.
+	first := true
+	for _, r := range results {
+		for _, p := range r.problems(policy) {
+			if first {
+				fmt.Fprintln(o.w)
+				first = false
+			}
+			fmt.Fprintln(o.w, o.paint(o.bad, r.Context))
+			for _, l := range strings.Split(o.wrapIndented(p, "  "), "\n") {
+				fmt.Fprintln(o.w, o.paint(o.dim, l))
+			}
 		}
 	}
 	return nil
+}
+
+// problems lists what is worth a line of its own under the table.
+func (r checkResult) problems(policy versionPolicy) []string {
+	var out []string
+	if r.Error != "" {
+		out = append(out, r.Error)
+	}
+	if r.Health == "degraded" {
+		out = append(out, "readyz failing: "+strings.Join(r.Failing, ", "))
+	}
+	if policy.outdated(r.Version) {
+		out = append(out, policy.explain(r.Version))
+	}
+	return out
+}
+
+func (o *output) healthCell(r checkResult) cell {
+	switch r.Health {
+	case "ok":
+		return cell{"ok", o.ok}
+	case "degraded":
+		return cell{"degraded", o.bad}
+	}
+	return cell{}
+}
+
+func (o *output) versionCell(v string, policy versionPolicy) cell {
+	if policy.outdated(v) {
+		return cell{v + "!", o.warn}
+	}
+	return cell{v, o.plain}
+}
+
+func (o *output) nodesCell(n *nodeCount) cell {
+	if n == nil {
+		return cell{}
+	}
+	if n.Ready < n.Total {
+		return cell{n.String(), o.warn}
+	}
+	return cell{n.String(), o.plain}
 }
 
 // shortUser abbreviates service account names, the usual long ones.
@@ -188,7 +245,7 @@ func formatExpiry(t *time.Time, now time.Time) string {
 // usually open to anonymous users, so only the second call proves the
 // credentials work.
 func probe(ctx context.Context, cfg *api.Config, name string) checkResult {
-	res := checkResult{Context: name, Expires: credentialsExpiry(cfg, name)}
+	res := checkResult{Context: name, Expires: credentialsExpiry(cfg, name), CheckedAt: time.Now()}
 	var start time.Time
 	fail := func(err error) checkResult {
 		if !start.IsZero() {
@@ -246,6 +303,8 @@ func probe(ctx context.Context, cfg *api.Config, name string) checkResult {
 	res.Latency = time.Since(start).Milliseconds()
 	res.User = review.Status.UserInfo.Username
 	res.Status = "ok"
+	res.Health, res.Failing = readyz(ctx, hc, base)
+	res.Nodes = countNodes(ctx, hc, base)
 	return res
 }
 
@@ -262,34 +321,39 @@ func (e *httpError) Error() string {
 }
 
 func call(ctx context.Context, hc *http.Client, method, u string, body []byte, out any) error {
-	req, err := http.NewRequestWithContext(ctx, method, u, bytes.NewReader(body))
+	code, data, err := fetch(ctx, hc, method, u, body, "application/json", 1<<20)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Accept", "application/json")
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	resp, err := hc.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return err
-	}
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+	if code < 200 || code > 299 {
 		var status struct {
 			Message string `json:"message"`
 		}
 		_ = json.Unmarshal(data, &status)
-		return &httpError{code: resp.StatusCode, msg: status.Message}
+		return &httpError{code: code, msg: status.Message}
 	}
 	if out == nil {
 		return nil
 	}
 	return json.Unmarshal(data, out)
+}
+
+func fetch(ctx context.Context, hc *http.Client, method, u string, body []byte, accept string, limit int64) (int, []byte, error) {
+	req, err := http.NewRequestWithContext(ctx, method, u, bytes.NewReader(body))
+	if err != nil {
+		return 0, nil, err
+	}
+	req.Header.Set("Accept", accept)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := hc.Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(resp.Body, limit))
+	return resp.StatusCode, data, err
 }
 
 func classify(err error) (status, detail string) {

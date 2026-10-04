@@ -20,12 +20,13 @@ type output struct {
 	color bool
 	width int // 0 means unlimited
 
-	plain, ok, bad, warn, dim, bold, title, header lipgloss.Style
+	plain, ok, bad, warn, dim, bold, title, header, sel lipgloss.Style
 }
 
 func newOutput(w io.Writer) *output {
 	o := &output{w: w}
-	if f, isFile := w.(*os.File); isFile && term.IsTerminal(f.Fd()) {
+	if isTerminal(w) {
+		f := w.(*os.File)
 		o.tty = true
 		if width, _, err := term.GetSize(f.Fd()); err == nil {
 			o.width = width
@@ -42,7 +43,13 @@ func newOutput(w io.Writer) *output {
 	o.bold = r.NewStyle().Bold(true)
 	o.title = r.NewStyle().Bold(true).Foreground(lipgloss.Color("4"))
 	o.header = r.NewStyle().Faint(true)
+	o.sel = r.NewStyle().Reverse(true)
 	return o
+}
+
+func isTerminal(v any) bool {
+	f, ok := v.(*os.File)
+	return ok && term.IsTerminal(f.Fd())
 }
 
 func (o *output) paint(st lipgloss.Style, s string) string {
@@ -72,6 +79,14 @@ type row struct {
 }
 
 func (o *output) table(cols []column, rows []row) error {
+	lines := o.render(cols, rows)
+	_, err := io.WriteString(o.w, strings.Join(lines, "\n")+"\n")
+	return err
+}
+
+// render lays rows out to the output width. The first line is the column
+// header; the rest map one to one onto rows.
+func (o *output) render(cols []column, rows []row) []string {
 	nat := make([]int, len(cols))
 	for i, c := range cols {
 		nat[i] = ansi.StringWidth(c.title)
@@ -83,8 +98,7 @@ func (o *output) table(cols []column, rows []row) error {
 	}
 	show, widths := fit(cols, nat, o.width)
 
-	var b strings.Builder
-	line := func(cells []cell) {
+	line := func(cells []cell) string {
 		var parts []string
 		for i, c := range cells {
 			if !show[i] {
@@ -94,26 +108,29 @@ func (o *output) table(cols []column, rows []row) error {
 			pad := strings.Repeat(" ", widths[i]-ansi.StringWidth(text))
 			parts = append(parts, o.paint(c.style, text)+pad)
 		}
-		b.WriteString(strings.TrimRight(strings.Join(parts, strings.Repeat(" ", colGap)), " "))
-		b.WriteByte('\n')
+		l := strings.TrimRight(strings.Join(parts, strings.Repeat(" ", colGap)), " ")
+		if o.width > 0 {
+			// Even the minimum widths may not fit a very narrow window.
+			l = ansi.Truncate(l, o.width-1, "…")
+		}
+		return l
 	}
 	header := make([]cell, len(cols))
 	for i, c := range cols {
 		header[i] = cell{c.title, o.header}
 	}
-	line(header)
+	lines := []string{line(header)}
 	for _, r := range rows {
 		if r.cells == nil {
 			if o.width > 0 {
 				r.title = ansi.Truncate(r.title, o.width-1, "…")
 			}
-			b.WriteString(r.title + "\n")
+			lines = append(lines, r.title)
 			continue
 		}
-		line(r.cells)
+		lines = append(lines, line(r.cells))
 	}
-	_, err := io.WriteString(o.w, b.String())
-	return err
+	return lines
 }
 
 // fit decides which columns to show and how wide, so that a row fits limit:

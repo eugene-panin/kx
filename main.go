@@ -76,6 +76,13 @@ Clusters are addressed as <client>/<cluster>.`,
 		Version:       version,
 		SilenceUsage:  true,
 		SilenceErrors: true,
+		Args:          cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if !isTerminal(a.stdin) || !isTerminal(a.stdout) {
+				return cmd.Help()
+			}
+			return a.tui()
+		},
 	}
 
 	var (
@@ -172,6 +179,22 @@ Clusters are addressed as <client>/<cluster>.`,
 		},
 	}
 
+	use := &cobra.Command{
+		Use:   "use [client/cluster]",
+		Short: "Set current-context, or print it without arguments",
+		Long: `Set current-context: the cluster kubectl, helm, k9s and friends talk to when
+no --context is given. Without arguments prints the current one.`,
+		Args:              cobra.MaximumNArgs(1),
+		ValidArgsFunction: a.completeRefs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			var r string
+			if len(args) == 1 {
+				r = args[0]
+			}
+			return a.use(r)
+		},
+	}
+
 	export := &cobra.Command{
 		Use:               "export <client|client/cluster>...",
 		Short:             "Print a self-contained kubeconfig for the given clusters",
@@ -230,6 +253,18 @@ under 30 days. Errors are listed below the table; --json has full details.`,
 	check.Flags().BoolVar(&checkJSON, "json", false, "print JSON")
 	check.Flags().DurationVarP(&timeout, "timeout", "t", 5*time.Second, "per-cluster timeout")
 
+	ui := &cobra.Command{
+		Use:   "ui",
+		Short: "Interactive mode (also what plain `kx` runs in a terminal)",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if !isTerminal(a.stdin) || !isTerminal(a.stdout) {
+				return errors.New("kx ui needs a terminal")
+			}
+			return a.tui()
+		},
+	}
+
 	var buildForce bool
 	build := &cobra.Command{
 		Use:   "build",
@@ -245,7 +280,7 @@ under 30 days. Errors are listed below the table; --json has full details.`,
 	}
 	build.Flags().BoolVar(&buildForce, "force", false, "drop contexts kx does not manage")
 
-	root.AddCommand(add, importCurrent, ls, on, off, rm, mv, export, execCmd, check, build)
+	root.AddCommand(add, importCurrent, ls, use, on, off, rm, mv, export, execCmd, check, ui, build)
 	return root
 }
 
