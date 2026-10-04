@@ -130,7 +130,9 @@ func (a *App) Add(src, client, name string, contexts []string, force bool) ([]st
 	return added, nil
 }
 
-func (a *App) ImportCurrent(client string) error {
+// ImportCurrent takes over the contexts of the kubeconfig kx does not manage,
+// under client; with dryRun it only says what it would import.
+func (a *App) ImportCurrent(client string, dryRun bool) error {
 	if !store.ValidName(client) {
 		return fmt.Errorf("%w: client %q, want [A-Za-z0-9._-]", store.ErrInvalidName, client)
 	}
@@ -159,6 +161,10 @@ func (a *App) ImportCurrent(client string) error {
 			r.Cluster = fmt.Sprintf("%s-%d", base, i)
 		}
 		taken[r] = true
+		if dryRun {
+			fmt.Fprintf(a.Stdout, "would import %s as %s\n", ctx, r)
+			continue
+		}
 		one, err := store.Extract(cfg, ctx, r.String())
 		if err != nil {
 			return err
@@ -168,6 +174,9 @@ func (a *App) ImportCurrent(client string) error {
 		}
 		renames[ctx] = r.String()
 		a.say("imported %s as %s", ctx, r)
+	}
+	if dryRun {
+		return nil
 	}
 	// The originals now live in the store under new names; let the build drop them.
 	st, err := a.Store.LoadState()
@@ -570,6 +579,9 @@ func (a *App) Use(arg string) error {
 		return err
 	}
 	if r.Cluster == "" {
+		if _, err := a.Store.Expand([]string{r.Client}); err != nil {
+			return fmt.Errorf("no client or cluster named %s", r)
+		}
 		return fmt.Errorf("%s is a client; use takes a cluster: %s/<cluster>", r, r)
 	}
 	unlock, err := a.lock()

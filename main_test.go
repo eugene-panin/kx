@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -1083,5 +1084,69 @@ func TestExecMissingCommand(t *testing.T) {
 	entries, _ := os.ReadDir(filepath.Join(e.Home, "exec"))
 	if len(entries) != 0 {
 		t.Errorf("exec left %d files behind", len(entries))
+	}
+}
+
+func TestUseUnknownName(t *testing.T) {
+	e := newEnv(t)
+	e.ok("add", e.Kubeconfig("a.yaml", "https://a"), "-c", "acme", "-n", "prod")
+	if _, err := e.run("", "use", "nosuch"); err == nil || !strings.Contains(err.Error(), "no client or cluster named nosuch") {
+		t.Errorf("unknown name: %v", err)
+	}
+	if _, err := e.run("", "use", "acme"); err == nil || !strings.Contains(err.Error(), "acme is a client") {
+		t.Errorf("a client: %v", err)
+	}
+}
+
+func TestImportCurrentDryRun(t *testing.T) {
+	e := newEnv(t)
+	e.ok("add", e.Kubeconfig("a.yaml", "https://a"), "-c", "acme", "-n", "prod")
+	cfg, err := clientcmd.LoadFromFile(e.Target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreign, err := clientcmd.LoadFromFile(e.Kubeconfig("eks.yaml", "https://eks"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Clusters["shop"] = foreign.Clusters["kubernetes"]
+	cfg.AuthInfos["shop"] = foreign.AuthInfos["kubernetes-admin"]
+	ctx := foreign.Contexts["kubernetes-admin@kubernetes"]
+	ctx.Cluster, ctx.AuthInfo = "shop", "shop"
+	cfg.Contexts["shop"] = ctx
+	if err := clientcmd.WriteToFile(*cfg, e.Target); err != nil {
+		t.Fatal(err)
+	}
+
+	if out := e.ok("import-current", "--dry-run"); !strings.Contains(out, "would import shop as unsorted/shop") {
+		t.Errorf("dry run said:\n%s", out)
+	}
+	e.WantContexts("acme/prod", "shop")
+	if out := e.ok("ls"); strings.Contains(out, "unsorted") {
+		t.Errorf("dry run imported:\n%s", out)
+	}
+}
+
+// Ctrl-C during a check leaves the results of the check before it.
+func TestInterruptedCheckKeepsResults(t *testing.T) {
+	e := newEnv(t)
+	e.ok("add", e.Kubeconfig("a.yaml", "https://a"), "-c", "acme", "-n", "prod")
+	e.run("", "check")
+	a, err := app.New(strings.NewReader(""), io.Discard, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := a.LoadChecks()
+	if err != nil || before["acme/prod"].Status == "" {
+		t.Fatalf("no result to keep: %v, %v", before, err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := a.Check(ctx, []string{"acme/prod"}, false, time.Second, false); err == nil {
+		t.Error("an interrupted check succeeded")
+	}
+	after, _ := a.LoadChecks()
+	if !after["acme/prod"].CheckedAt.Equal(before["acme/prod"].CheckedAt) {
+		t.Errorf("the interrupt replaced the result: %+v, was %+v", after["acme/prod"], before["acme/prod"])
 	}
 }

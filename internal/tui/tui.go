@@ -436,7 +436,7 @@ func (m model) updateNormal(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.status = "nothing to import"
 			return m, nil
 		}
-		return m.mutate(func(q *app.App) error { return q.ImportCurrent("unsorted") })
+		return m.mutate(func(q *app.App) error { return q.ImportCurrent("unsorted", false) })
 	case key.Matches(msg, keys.Check):
 		return m.startChecks()
 	}

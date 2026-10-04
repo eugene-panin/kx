@@ -209,9 +209,10 @@ func (a cli) command() *cobra.Command {
 builds ~/.kube/config from the ones that are on. Clusters are addressed as
 <client>/<cluster>. In a terminal, plain kx opens the interactive view.
 
-Files: clusters in $KX_HOME or ~/.config/kx, backups in ~/.local/state/kx,
-check results in ~/.cache/kx. The kubeconfig it builds is $KX_KUBECONFIG
-or ~/.kube/config. NO_COLOR, KX_NO_COLOR and FORCE_COLOR are honored.
+Files: clusters in ~/.config/kx, backups in ~/.local/state/kx, check results
+in ~/.cache/kx (XDG_CONFIG_HOME, XDG_STATE_HOME and XDG_CACHE_HOME move them),
+or all of it in $KX_HOME. The kubeconfig it builds is $KX_KUBECONFIG or
+~/.kube/config. NO_COLOR, KX_NO_COLOR and FORCE_COLOR are honored.
 
 Exit codes: 0 done, 1 failed, 2 called wrong (bad flag or argument, or a
 question kx can't ask without a terminal).
@@ -393,20 +394,23 @@ question; pass -y, or kx exits 2. kx export keeps a copy.`,
 	}
 
 	var importClient string
+	var importDry bool
 	importCurrent := &cobra.Command{
 		Use:     "import-current",
 		Short:   "Take over contexts in ~/.kube/config that kx does not manage yet",
 		GroupID: "clusters",
 		Long: `Take over every context in ~/.kube/config that kx doesn't manage, e.g. one
 written by aws eks update-kubeconfig, under client -c. Sort them out with mv.`,
-		Example: `  kx import-current
+		Example: `  kx import-current --dry-run
+  kx import-current
   kx import-current -c acme`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return a.ImportCurrent(importClient)
+			return a.ImportCurrent(importClient, importDry)
 		},
 	}
 	importCurrent.Flags().StringVarP(&importClient, "client", "c", "unsorted", "client to put the contexts under")
+	importCurrent.Flags().BoolVar(&importDry, "dry-run", false, "list what would be imported and change nothing")
 
 	use := &cobra.Command{
 		Use:     "use [client/cluster]",

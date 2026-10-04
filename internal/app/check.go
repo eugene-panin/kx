@@ -102,8 +102,12 @@ func (a *App) probeAll(ctx context.Context, refs []store.Ref, timeout time.Durat
 		})
 	}
 	wg.Wait()
-	if err := a.SaveChecks(results); err != nil {
-		fmt.Fprintln(a.Stderr, "kx: save check results:", err)
+	// After Ctrl-C the unfinished probes report the interrupt, not the
+	// cluster; keep the results from before instead.
+	if ctx.Err() == nil {
+		if err := a.SaveChecks(results); err != nil {
+			fmt.Fprintln(a.Stderr, "kx: save check results:", err)
+		}
 	}
 	return results, nil
 }
