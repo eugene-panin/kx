@@ -47,7 +47,7 @@ kx rm  <client|client/cluster>... [-y]
 kx mv  <from> <to>
 kx export <client|client/cluster>...
 kx exec <client|client/cluster>... -- <command> [args...]
-kx check [client|client/cluster]... [--all] [--json] [--timeout 5s]
+kx check [client|client/cluster]... [--all] [--json] [--timeout 10s]
 kx import-current [-c unsorted]
 kx build [--force]
 ```

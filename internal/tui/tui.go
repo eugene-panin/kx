@@ -148,7 +148,7 @@ func newModel(a *app.App) model {
 		checking:  map[string]bool{},
 		started:   time.Now(),
 		sem:       make(chan struct{}, probe.Parallel),
-		timeout:   5 * time.Second,
+		timeout:   probe.Timeout,
 		spin:      sp,
 		help:      help.New(),
 		clipboard: readClipboard,

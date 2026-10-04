@@ -29,7 +29,9 @@ import (
 
 const (
 	// Parallel caps concurrent probes.
-	Parallel   = 16
+	Parallel = 16
+	// Timeout is the default budget for probing one cluster, all calls included.
+	Timeout    = 10 * time.Second
 	ExpirySoon = 30 * 24 * time.Hour
 )
 

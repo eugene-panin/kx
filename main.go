@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/eugene-panin/kx/internal/app"
+	"github.com/eugene-panin/kx/internal/probe"
 	"github.com/eugene-panin/kx/internal/table"
 	"github.com/eugene-panin/kx/internal/tui"
 	"github.com/spf13/cobra"
@@ -245,7 +246,7 @@ under 30 days. Errors are listed below the table; --json has full details.`,
 	}
 	check.Flags().BoolVarP(&checkAll, "all", "a", false, "include disabled clusters")
 	check.Flags().BoolVar(&checkJSON, "json", false, "print JSON")
-	check.Flags().DurationVarP(&timeout, "timeout", "t", 5*time.Second, "per-cluster timeout")
+	check.Flags().DurationVarP(&timeout, "timeout", "t", probe.Timeout, "per-cluster timeout")
 
 	ui := &cobra.Command{
 		Use:   "ui",
