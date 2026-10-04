@@ -14,6 +14,16 @@ import (
 	"k8s.io/client-go/tools/clientcmd/api"
 )
 
+// UsageError is a mistake in how kx was called; main exits with 2 for it.
+// Hint, if any, says how to call it right.
+type UsageError struct {
+	Err  error
+	Hint string
+}
+
+func (e *UsageError) Error() string { return e.Err.Error() }
+func (e *UsageError) Unwrap() error { return e.Err }
+
 // ExitError carries a child's exit status up to main without an error message.
 type ExitError int
 

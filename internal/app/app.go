@@ -54,6 +54,8 @@ type App struct {
 	Stdin  io.Reader
 	Stdout io.Writer
 	Stderr io.Writer
+
+	lastBackup string // where the last Build put the file it replaced, if anywhere
 }
 
 func (a *App) loadTarget() (*api.Config, error) {
@@ -157,8 +159,10 @@ func (a *App) Build(force bool, renames map[string]string) error {
 		names = append(names, store.ContextNames(cfg)...)
 	}
 	out := store.Merge(parts)
+	var previous string
 	// A broken target is only possible with --force; it just loses current-context then.
 	if cur, err := a.loadTarget(); err == nil {
+		previous = cur.CurrentContext
 		name := cur.CurrentContext
 		if n, ok := renames[name]; ok {
 			name = n
@@ -171,11 +175,12 @@ func (a *App) Build(force bool, renames map[string]string) error {
 	if err != nil {
 		return err
 	}
+	a.lastBackup = ""
 	old, err := os.ReadFile(a.Target)
 	switch {
 	case err == nil && bytes.Equal(old, data):
 	case err == nil:
-		if err := a.backup(old); err != nil {
+		if a.lastBackup, err = a.backup(old); err != nil {
 			return fmt.Errorf("backup %s: %w", a.Target, err)
 		}
 		fallthrough
@@ -187,18 +192,26 @@ func (a *App) Build(force bool, renames map[string]string) error {
 		return err
 	}
 	st.Generated = names
-	return a.Store.SaveState(st)
+	if err := a.Store.SaveState(st); err != nil {
+		return err
+	}
+	if previous != "" && out.CurrentContext == "" {
+		// kubectl would now fail with "no context"; say why.
+		fmt.Fprintf(a.Stderr, "kx: current-context %s is off or gone, none is set now; pick one with kx use\n", previous)
+	}
+	return nil
 }
 
-func (a *App) backup(data []byte) error {
+// backup keeps data as the newest backup and returns its path.
+func (a *App) backup(data []byte) (string, error) {
 	dir := a.Store.BackupsDir()
-	name := "config-" + time.Now().Format("20060102-150405.000000")
-	if err := store.WriteFile(filepath.Join(dir, name), data); err != nil {
-		return err
+	path := filepath.Join(dir, "config-"+time.Now().Format("20060102-150405.000000"))
+	if err := store.WriteFile(path, data); err != nil {
+		return "", err
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return err
+		return "", err
 	}
 	var backups []string
 	for _, e := range entries {
@@ -209,18 +222,42 @@ func (a *App) backup(data []byte) error {
 	slices.Sort(backups)
 	for len(backups) > keepBackups {
 		if err := os.Remove(filepath.Join(dir, backups[0])); err != nil {
-			return err
+			return "", err
 		}
 		backups = backups[1:]
 	}
-	return nil
+	return path, nil
 }
 
-// Rebuild is `kx build`: pull hand edits in and regenerate the target.
-// With force the target may be unreadable, so namespaces are best effort then.
+// Rebuild is `kx build`: pull hand edits in, regenerate the target and say
+// what happened, including the foreign contexts --force drops. With force the
+// target may be unreadable, so taking hand edits in is best effort then.
 func (a *App) Rebuild(force bool) error {
 	if err := a.SyncAndReport(); err != nil && !force {
 		return err
 	}
-	return a.Build(force, nil)
+	var dropped []string
+	if force {
+		// Best effort: an unreadable target has nothing to list.
+		dropped, _ = a.Unmanaged()
+	}
+	if err := a.Build(force, nil); err != nil {
+		return err
+	}
+	for _, d := range dropped {
+		fmt.Fprintf(a.Stdout, "dropped %s\n", d)
+	}
+	cfg, err := a.loadTarget()
+	if err != nil {
+		return err
+	}
+	n, noun := len(cfg.Contexts), "clusters"
+	if n == 1 {
+		noun = "cluster"
+	}
+	fmt.Fprintf(a.Stdout, "wrote %s: %d %s\n", a.TargetName(), n, noun)
+	if a.lastBackup != "" {
+		fmt.Fprintf(a.Stdout, "previous version: %s\n", a.lastBackup)
+	}
+	return nil
 }

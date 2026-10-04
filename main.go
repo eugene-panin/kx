@@ -14,6 +14,7 @@ import (
 	"github.com/eugene-panin/kx/internal/table"
 	"github.com/eugene-panin/kx/internal/tui"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
 
 // version is set with -ldflags "-X main.version=..." in release builds.
@@ -31,15 +32,32 @@ func buildVersion() string {
 	return version
 }
 
+// Exit codes: 0 ok, 1 the command failed, 2 kx was called wrong (bad flag,
+// argument or missing confirmation), anything else is passed through from
+// `kx exec` or reported by `kx check`.
 func main() {
-	err := run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr)
-	var code app.ExitError
+	os.Exit(report(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr), os.Stderr))
+}
+
+func report(err error, stderr io.Writer) int {
+	var (
+		code  app.ExitError
+		usage *app.UsageError
+	)
 	switch {
+	case err == nil:
+		return 0
 	case errors.As(err, &code):
-		os.Exit(int(code))
-	case err != nil:
-		fmt.Fprintln(os.Stderr, "kx:", err)
-		os.Exit(1)
+		return int(code)
+	case errors.As(err, &usage):
+		fmt.Fprintln(stderr, "kx:", usage.Err)
+		if usage.Hint != "" {
+			fmt.Fprintln(stderr, usage.Hint)
+		}
+		return 2
+	default:
+		fmt.Fprintln(stderr, "kx:", err)
+		return 1
 	}
 }
 
@@ -53,7 +71,39 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	root.SetIn(stdin)
 	root.SetOut(stdout)
 	root.SetErr(stderr)
-	return root.Execute()
+	root.SetFlagErrorFunc(helpWins(args))
+	cmd, err := root.ExecuteC()
+	if err != nil && isCobraUsage(err) {
+		return &app.UsageError{Err: err, Hint: "Run '" + cmd.CommandPath() + " --help' for usage."}
+	}
+	return err
+}
+
+// helpWins turns a flag error into help when -h or --help is on the line, so
+// `kx add --bogus -h` shows help instead of complaining about --bogus.
+func helpWins(args []string) func(*cobra.Command, error) error {
+	return func(c *cobra.Command, err error) error {
+		for _, a := range args {
+			if a == "--" {
+				break
+			}
+			if a == "-h" || a == "--help" {
+				return pflag.ErrHelp
+			}
+		}
+		return &app.UsageError{Err: err, Hint: "Run '" + c.CommandPath() + " --help' for usage."}
+	}
+}
+
+// isCobraUsage recognizes the argument errors cobra reports as plain errors.
+func isCobraUsage(err error) bool {
+	msg := err.Error()
+	for _, p := range []string{"unknown command", "accepts ", "requires ", "required flag", "invalid argument"} {
+		if strings.HasPrefix(msg, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // cli wires App into cobra commands.
@@ -71,7 +121,8 @@ Clusters are addressed as <client>/<cluster>.`,
 		Version:       buildVersion(),
 		SilenceUsage:  true,
 		SilenceErrors: true,
-		Args:          cobra.NoArgs,
+		// No Args validator: cobra's default for a root with subcommands is
+		// what turns `kx lss` into "unknown command ... Did you mean ls?".
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if !table.IsTerminal(a.Stdin) || !table.IsTerminal(a.Stdout) {
 				return cmd.Help()
@@ -276,6 +327,9 @@ Expiry (days left) is read from client certificates and JWT tokens; "!" marks
 under 30 days. Errors are listed below the table; --json has full details.`,
 		ValidArgsFunction: a.completeRefs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if timeout <= 0 {
+				return &app.UsageError{Err: fmt.Errorf("--timeout must be positive, got %s", timeout), Hint: "e.g. --timeout 10s"}
+			}
 			return a.Check(cmd.Context(), args, checkAll, timeout, checkJSON)
 		},
 	}

@@ -24,12 +24,23 @@ func (a *App) Add(src, client, name string, contexts []string, force bool) ([]st
 		return nil, fmt.Errorf("invalid client name %q", client)
 	}
 	if src != "-" {
-		if abs, err := filepath.Abs(src); err == nil && abs == a.Target {
+		// a.Target has its symlinks resolved; resolve src the same way, or a
+		// dotfiles-managed ~/.kube/config slips past this guard.
+		abs, err := filepath.Abs(src)
+		if err == nil {
+			if real, err := filepath.EvalSymlinks(abs); err == nil {
+				abs = real
+			}
+		}
+		if abs == a.Target {
 			return nil, fmt.Errorf("%s is the file kx generates; use `kx import-current` to take over its contexts", src)
 		}
 	}
 	if err := a.prepare(); err != nil {
 		return nil, err
+	}
+	if src == "-" && table.IsTerminal(a.Stdin) {
+		fmt.Fprintln(a.Stderr, "Paste the kubeconfig, then press Ctrl-D (Ctrl-C to cancel).")
 	}
 	cfg, err := store.ReadKubeconfig(src, a.Stdin)
 	if err != nil {
@@ -297,22 +308,30 @@ func (a *App) Toggle(args []string, on bool) error {
 	if on {
 		word = "on"
 	}
-	for _, arg := range args {
-		if _, err := a.Store.Expand([]string{arg}); err != nil {
-			return err
-		}
-		r, _ := store.ParseRef(arg)
+	// Check every argument before changing anything, so one typo at the end
+	// doesn't leave half the request applied and reported as done.
+	if _, err := a.Store.Expand(args); err != nil {
+		return err
+	}
+	refs := make([]store.Ref, len(args))
+	for i, arg := range args {
+		refs[i], _ = store.ParseRef(arg)
 		if on {
-			st.Enable(r, all)
+			st.Enable(refs[i], all)
 		} else {
-			st.Disable(r)
+			st.Disable(refs[i])
 		}
-		fmt.Fprintf(a.Stdout, "%s: %s\n", r, word)
 	}
 	if err := a.Store.SaveState(st); err != nil {
 		return err
 	}
-	return a.Build(false, nil)
+	if err := a.Build(false, nil); err != nil {
+		return err
+	}
+	for _, r := range refs {
+		fmt.Fprintf(a.Stdout, "%s: %s\n", r, word)
+	}
+	return nil
 }
 
 func (a *App) Remove(args []string, yes bool) error {
@@ -323,18 +342,19 @@ func (a *App) Remove(args []string, yes bool) error {
 	if err != nil {
 		return err
 	}
-	if len(refs) > 1 && !yes {
+	// The store holds the only copy of a cluster's credentials once it's off,
+	// so every removal is confirmed, one cluster or many.
+	if !yes {
 		names := make([]string, len(refs))
 		for i, r := range refs {
 			names[i] = r.String()
 		}
-		ok, err := a.confirm(fmt.Sprintf("remove %d clusters: %s?", len(refs), strings.Join(names, ", ")))
-		if err != nil {
-			return err
+		question := "remove " + names[0] + "?"
+		if len(refs) > 1 {
+			question = fmt.Sprintf("remove %d clusters: %s?", len(refs), strings.Join(names, ", "))
 		}
-		if !ok {
-			fmt.Fprintln(a.Stderr, "aborted")
-			return nil
+		if err := a.confirm(question, "-y"); err != nil {
+			return err
 		}
 	}
 	for _, r := range refs {
@@ -394,6 +414,7 @@ func (a *App) Move(fromArg, toArg string) error {
 		return err
 	}
 	renames := map[string]string{}
+	var turnedOff []store.Ref
 	for _, m := range moves {
 		renames[m.from.String()] = m.to.String()
 		wasOff := !st.Enabled(m.from)
@@ -402,6 +423,8 @@ func (a *App) Move(fromArg, toArg string) error {
 		}
 		if wasOff {
 			st.Disabled = append(st.Disabled, m.to.String())
+		} else if !st.Enabled(m.to) {
+			turnedOff = append(turnedOff, m.to)
 		}
 		fmt.Fprintf(a.Stdout, "moved %s -> %s\n", m.from, m.to)
 	}
@@ -411,7 +434,13 @@ func (a *App) Move(fromArg, toArg string) error {
 	if err := a.pruneState(); err != nil {
 		return err
 	}
-	return a.Build(false, renames)
+	if err := a.Build(false, renames); err != nil {
+		return err
+	}
+	for _, r := range turnedOff {
+		fmt.Fprintf(a.Stdout, "%s is off now: client %s is off (kx on %s turns it back on)\n", r, r.Client, r)
+	}
+	return nil
 }
 
 func (a *App) Export(args []string) error {
@@ -568,16 +597,22 @@ func (a *App) pruneState() error {
 	return a.Store.SaveState(st)
 }
 
-func (a *App) confirm(question string) (bool, error) {
+// confirm asks on the terminal and returns nil on yes. Without a terminal it
+// doesn't ask at all: a question nobody can answer only hangs scripts.
+func (a *App) confirm(question, flag string) error {
+	if !table.IsTerminal(a.Stdin) {
+		return &UsageError{Err: errors.New("needs confirmation and stdin is not a terminal"), Hint: "pass " + flag + " to go ahead without asking"}
+	}
 	fmt.Fprintf(a.Stderr, "%s [y/N] ", question)
 	line, err := bufio.NewReader(a.Stdin).ReadString('\n')
 	if err != nil && line == "" {
 		fmt.Fprintln(a.Stderr)
-		return false, fmt.Errorf("no confirmation; pass -y to skip it")
+		return &UsageError{Err: errors.New("no answer"), Hint: "pass " + flag + " to go ahead without asking"}
 	}
 	switch strings.ToLower(strings.TrimSpace(line)) {
 	case "y", "yes":
-		return true, nil
+		return nil
 	}
-	return false, nil
+	fmt.Fprintln(a.Stderr, "aborted")
+	return ExitError(1)
 }

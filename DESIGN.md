@@ -64,7 +64,7 @@ kx build [--force]
 | `use` | Sets `current-context`, the cluster kubectl, helm and k9s talk to by default. Without an argument prints the current one. Only that one field is rewritten, with no rebuild and no backup, so switching back and forth doesn't push useful backups out. A cluster that is off can't be made current; turning off or removing the current cluster clears `current-context`. |
 | `ns` | Prints or sets the default namespace: of the current context, or of the named cluster (even one that is off). Written to the target and to the store, rewriting only that field, with no rebuild and no backup. The name is checked against Kubernetes rules (DNS-1123 label) but not looked up in the cluster, so it works offline. |
 | `on`/`off` | Turn on or off. `on acme/prod` while `acme` is off turns on prod only. |
-| `rm` | Remove. Removing more than one cluster asks first (`-y` skips the question). |
+| `rm` | Remove. Always asks first, one cluster or many: once a cluster is off, the store holds the only copy of its credentials. `-y` skips the question. Without a terminal there's no question at all: kx exits 2 and asks for `-y`. |
 | `mv` | `mv acme/old acme/new` renames a cluster, `mv unsorted/x acme` moves it to a client, `mv acme acme-corp` renames a client. |
 | `export` | Prints a kubeconfig with the given clusters to stdout, including ones that are off. |
 | `exec` | Runs a command with `KUBECONFIG` pointing at a temporary file holding just the given clusters (including ones that are off). The first one is current. Sets `KX_SCOPE`. Exits with the command's exit code. The temporary file is removed afterwards. |
@@ -72,6 +72,21 @@ kx build [--force]
 | `import-current` | Takes over every context in `~/.kube/config` that isn't in the store, under client `-c` (`unsorted` by default). Sort them out with `mv` afterwards. |
 | `sync` | Takes hand edits of `~/.kube/config` into the store (see below). Every command does this first; `sync` runs it alone. |
 | `build` | Rebuilds `~/.kube/config`. Every command that changes something does this on its own. |
+
+## Exit codes
+
+0 done; 1 the command failed (a cluster down or degraded in `check`, a write
+error, a "no" to a question); 2 kx was called wrong (unknown command or flag,
+missing argument, invalid value, or a confirmation that can't be asked because
+stdin is not a terminal). `exec` passes the child's code through. Usage errors
+end with a pointer to the command's `--help`; a typo in a command name gets a
+"did you mean"; `-h` anywhere on the line shows help even next to a bad flag.
+
+Commands that change something say what changed, including side effects: a
+cleared current-context, a cluster turned off by moving it into a disabled
+client, foreign contexts dropped by `build --force` (with the backup path).
+Prompts only happen on a terminal, and are checked for before the question is
+printed.
 
 ## Output
 
@@ -119,7 +134,9 @@ of undoing it on the next rebuild:
   are reported; namespace switches (k9s, kubens) are taken silently;
 - a managed context that the last build wrote but that is gone now is turned
   off, not removed, and reported. `kx on` brings it back;
-- if the whole file is gone, that's a reset rather than a list of deletions:
+- if the whole file is gone, or none of the contexts the last build wrote is
+  left in it (emptied by a crashed editor, `>` instead of `>>`), that's a reset
+  rather than a list of deletions:
   nothing is turned off and the next build writes everything again;
 - contexts kx doesn't manage are left alone (see above).
 

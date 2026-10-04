@@ -37,6 +37,12 @@ func (a *App) Sync() ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	// None of what the last build wrote is left: the file was emptied or
+	// replaced wholesale (a crashed editor, `>` instead of `>>`). Like a missing
+	// file, that's a reset, not a list of deliberate deletions.
+	if len(st.Generated) > 0 && !slices.ContainsFunc(st.Generated, func(g string) bool { return cur.Contexts[g] != nil }) {
+		return []string{a.TargetName() + " has none of the clusters kx put there; kx build writes them again"}, nil
+	}
 	var notes []string
 	stateChanged := false
 	for _, r := range refs {

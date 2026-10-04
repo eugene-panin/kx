@@ -142,11 +142,12 @@ kx off acme/stage
 A cluster that is off stays in `~/.config/kx` but disappears from
 `~/.kube/config`, so Lens and k9s stop showing it.
 
-A project is over:
+A project is over (removal always asks; without a terminal kx won't ask and
+wants `-y` instead):
 
 ```bash
-kx rm globex        # asks first, -y to skip the question
-kx rm acme/stage
+kx rm globex        # asks first
+kx rm acme/stage -y # no question, for scripts
 ```
 
 Pick the cluster kubectl and helm use by default:
@@ -257,6 +258,16 @@ misbehave: it can still read `~/.kube/config` directly.
 | `KX_HOME` | `$XDG_CONFIG_HOME/kx` or `~/.config/kx` | where clusters, state and backups live |
 | `KX_KUBECONFIG` | `~/.kube/config` | the file kx builds |
 | `NO_COLOR` | | turn colors off |
+
+## Exit codes
+
+| code | meaning |
+|---|---|
+| 0 | done |
+| 1 | the command failed: a cluster is down or degraded in `check`, a file can't be written, you answered no |
+| 2 | kx was called wrong: unknown command or flag, missing argument, or a question it can't ask because stdin is not a terminal (pass `-y`) |
+
+`kx exec` exits with the code of the command it ran.
 
 ## Storage
 

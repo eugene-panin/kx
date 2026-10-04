@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -170,14 +171,22 @@ func TestRemove(t *testing.T) {
 	e.ok("add", e.Kubeconfig("c.yaml", "https://c"), "-c", "globex", "-n", "main")
 	e.ok("off", "acme")
 
-	if _, err := e.run("n\n", "rm", "acme"); err != nil {
-		t.Fatal(err)
+	// Without a terminal kx never asks: a piped answer is not taken, the
+	// question isn't printed, nothing is removed, and the exit code is 2.
+	for _, args := range [][]string{{"rm", "acme"}, {"rm", "globex/main"}, {"rm", "globex"}} {
+		for _, stdin := range []string{"", "y\n"} {
+			out, err := e.run(stdin, args...)
+			var usage *app.UsageError
+			if !errors.As(err, &usage) || report(err, io.Discard) != 2 {
+				t.Errorf("kx %v with stdin %q: err = %v, want a usage error", args, stdin, err)
+			}
+			if strings.Contains(out, "[y/N]") {
+				t.Errorf("kx %v asked without a terminal:\n%s", args, out)
+			}
+		}
 	}
-	if out := e.ok("ls", "acme"); !strings.Contains(out, "stage") {
-		t.Fatalf("declined rm removed clusters:\n%s", out)
-	}
-	if _, err := e.run("", "rm", "acme"); err == nil {
-		t.Error("rm of several clusters without confirmation succeeded")
+	if out := e.ok("ls"); !strings.Contains(out, "stage") || !strings.Contains(out, "main") {
+		t.Fatalf("refused rm removed clusters:\n%s", out)
 	}
 
 	e.ok("rm", "acme", "-y")
@@ -710,5 +719,98 @@ func TestBrokenTargetDoesNotBlockReads(t *testing.T) {
 	out := e.ok("ls")
 	if !strings.Contains(out, "kx: sync with") || !strings.Contains(out, "prod") {
 		t.Errorf("ls with a broken target:\n%s", out)
+	}
+}
+
+func TestEmptiedTargetIsAReset(t *testing.T) {
+	e := newEnv(t)
+	e.ok("add", e.Kubeconfig("a.yaml", "https://a"), "-c", "acme", "-n", "prod")
+	e.ok("add", e.Kubeconfig("b.yaml", "https://b"), "-c", "acme", "-n", "stage")
+	if err := os.WriteFile(e.Target, nil, 0o600); err != nil { // `: > ~/.kube/config`
+		t.Fatal(err)
+	}
+	out := e.ok("ls")
+	if strings.Contains(out, "turned off") || strings.Contains(out, " off") {
+		t.Errorf("an emptied kubeconfig turned clusters off:\n%s", out)
+	}
+	if !strings.Contains(out, "kx build writes them again") {
+		t.Errorf("no hint about the reset:\n%s", out)
+	}
+	e.ok("build")
+	e.WantContexts("acme/prod", "acme/stage")
+}
+
+func TestToggleIsAllOrNothing(t *testing.T) {
+	e := newEnv(t)
+	e.ok("add", e.Kubeconfig("a.yaml", "https://a"), "-c", "acme", "-n", "prod")
+	out, err := e.run("", "off", "acme/prod", "nope")
+	if err == nil || strings.Contains(out, "acme/prod: off") {
+		t.Errorf("off with a bad argument: err = %v\n%s", err, out)
+	}
+	e.WantContexts("acme/prod")
+}
+
+func TestAddRefusesSymlinkedTarget(t *testing.T) {
+	e := newEnv(t)
+	e.ok("add", e.Kubeconfig("a.yaml", "https://a"), "-c", "acme", "-n", "prod")
+	link := filepath.Join(e.Src, "dotfiles-config")
+	if err := os.Symlink(e.Target, link); err != nil {
+		t.Fatal(err)
+	}
+	// Point kx at the link the way a dotfiles setup does, then feed it back.
+	t.Setenv("KX_KUBECONFIG", link)
+	if _, err := e.run("", "add", link, "-c", "dup"); err == nil {
+		t.Error("adding the generated file through a symlink succeeded")
+	}
+	e.WantContexts("acme/prod")
+}
+
+func TestBuildSaysWhatItDid(t *testing.T) {
+	e := newEnv(t)
+	e.ok("add", e.Kubeconfig("a.yaml", "https://a"), "-c", "acme", "-n", "prod")
+	editTarget(t, e, func(cfg *api.Config) {
+		cfg.Contexts["eks"] = cfg.Contexts["acme/prod"].DeepCopy()
+	})
+	out := e.ok("build", "--force")
+	for _, want := range []string{"dropped eks", "wrote ", "1 cluster\n", "previous version: "} {
+		if !strings.Contains(out, want) {
+			t.Errorf("build --force output lacks %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestLosingCurrentContextIsReported(t *testing.T) {
+	e := newEnv(t)
+	e.ok("add", e.Kubeconfig("a.yaml", "https://a"), "-c", "acme", "-n", "prod")
+	e.ok("use", "acme/prod")
+	if out := e.ok("off", "acme"); !strings.Contains(out, "current-context acme/prod is off or gone") {
+		t.Errorf("turning off the current cluster says nothing about it:\n%s", out)
+	}
+}
+
+func TestMoveIntoDisabledClientIsReported(t *testing.T) {
+	e := newEnv(t)
+	e.ok("add", e.Kubeconfig("a.yaml", "https://a"), "-c", "acme", "-n", "stage")
+	e.ok("add", e.Kubeconfig("b.yaml", "https://b"), "-c", "globex", "-n", "main")
+	e.ok("off", "globex")
+	if out := e.ok("mv", "acme/stage", "globex"); !strings.Contains(out, "globex/stage is off now") {
+		t.Errorf("mv into a disabled client is silent about turning it off:\n%s", out)
+	}
+}
+
+func TestUsageErrors(t *testing.T) {
+	e := newEnv(t)
+	for _, args := range [][]string{{"--bogus"}, {"add"}, {"lss"}, {"check", "--timeout", "0s"}, {"add", "-c"}} {
+		out, err := e.run("", args...)
+		if code := report(err, io.Discard); code != 2 {
+			t.Errorf("kx %v: exit %d, want 2 (%v)\n%s", args, code, err, out)
+		}
+	}
+	if _, err := e.run("", "lss"); err == nil || !strings.Contains(err.Error(), "Did you mean") {
+		t.Errorf("no suggestion for a typo: %v", err)
+	}
+	out, err := e.run("", "add", "--bogus", "-h")
+	if err != nil || !strings.Contains(out, "Usage:") {
+		t.Errorf("-h after a bad flag: err = %v\n%s", err, out)
 	}
 }
