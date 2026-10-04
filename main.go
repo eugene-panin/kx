@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 )
@@ -208,6 +209,27 @@ store stay readable.`,
 		},
 	}
 
+	var (
+		checkAll  bool
+		checkJSON bool
+		timeout   time.Duration
+	)
+	check := &cobra.Command{
+		Use:   "check [client|client/cluster]...",
+		Short: "Check that clusters answer and credentials work",
+		Long: `Check reachability, server version and credentials of clusters in parallel.
+Without arguments checks the enabled clusters. Exits 1 if any check fails.
+Expiry (days left) is read from client certificates and JWT tokens; "!" marks
+under 30 days. Errors are listed below the table; --json has full details.`,
+		ValidArgsFunction: a.completeRefs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return a.check(cmd.Context(), args, checkAll, timeout, checkJSON)
+		},
+	}
+	check.Flags().BoolVarP(&checkAll, "all", "a", false, "include disabled clusters")
+	check.Flags().BoolVar(&checkJSON, "json", false, "print JSON")
+	check.Flags().DurationVarP(&timeout, "timeout", "t", 5*time.Second, "per-cluster timeout")
+
 	var buildForce bool
 	build := &cobra.Command{
 		Use:   "build",
@@ -223,7 +245,7 @@ store stay readable.`,
 	}
 	build.Flags().BoolVar(&buildForce, "force", false, "drop contexts kx does not manage")
 
-	root.AddCommand(add, importCurrent, ls, on, off, rm, mv, export, execCmd, build)
+	root.AddCommand(add, importCurrent, ls, on, off, rm, mv, export, execCmd, check, build)
 	return root
 }
 

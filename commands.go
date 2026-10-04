@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
-	"text/tabwriter"
 
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/clientcmd/api"
@@ -188,19 +187,51 @@ func (a *app) list(client string, asJSON bool) error {
 		fmt.Fprintln(a.stderr, "no clusters yet: kx add <kubeconfig> -c <client>")
 		return nil
 	}
-	tw := tabwriter.NewWriter(a.stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "  CLIENT\tCLUSTER\tSERVER\tNAMESPACE\tSTATE")
-	for _, row := range rows {
-		mark, onoff := " ", "on"
-		if row.Current {
-			mark = "*"
+
+	o := newOutput(a.stdout)
+	if !o.tty {
+		// One line per cluster with the client on it, so grep keeps working.
+		cols := []column{{}, {title: "CLIENT"}, {title: "CLUSTER"}, {title: "SERVER"}, {title: "NAMESPACE"}, {title: "STATE"}}
+		var out []row
+		for _, r := range rows {
+			mark, state := " ", "on"
+			if r.Current {
+				mark = "*"
+			}
+			if !r.Enabled {
+				state = "off"
+			}
+			out = append(out, row{cells: []cell{{text: mark}, {text: r.Client}, {text: r.Cluster}, {text: r.Server}, {text: r.Namespace}, {text: state}}})
 		}
-		if !row.Enabled {
-			onoff = "off"
-		}
-		fmt.Fprintf(tw, "%s %s\t%s\t%s\t%s\t%s\n", mark, row.Client, row.Cluster, row.Server, row.Namespace, onoff)
+		return o.table(cols, out)
 	}
-	return tw.Flush()
+
+	cols := []column{{}, {title: "CLUSTER", shrink: 12}, {title: "SERVER", shrink: 16, trim: true}, {title: "NAMESPACE", drop: 1}, {title: "STATE"}}
+	var out []row
+	last := ""
+	for _, r := range rows {
+		if r.Client != last {
+			last = r.Client
+			title := o.paint(o.title, r.Client)
+			if !st.enabled(ref{client: r.Client}) {
+				title += " " + o.paint(o.dim, "off")
+			}
+			out = append(out, row{title: title})
+		}
+		base := o.plain
+		if !r.Enabled {
+			base = o.dim
+		}
+		mark, name, state := cell{"  ", base}, cell{r.Cluster, base}, cell{"on", o.ok}
+		if r.Current {
+			mark, name.style = cell{" *", o.ok}, o.bold
+		}
+		if !r.Enabled {
+			state = cell{"off", o.dim}
+		}
+		out = append(out, row{cells: []cell{mark, name, {r.Server, base}, {r.Namespace, base}, state}})
+	}
+	return o.table(cols, out)
 }
 
 func (a *app) toggle(args []string, on bool) error {
