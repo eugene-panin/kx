@@ -226,7 +226,7 @@ misbehave: it can still read `~/.kube/config` directly.
 Any file under `clusters/` can be used directly:
 `KUBECONFIG=~/.config/kx/clusters/acme/prod.yaml kubectl get pods`.
 
-Design notes (in Russian) are in [DESIGN.md](DESIGN.md).
+Design notes are in [DESIGN.md](DESIGN.md).
 
 ## License
 

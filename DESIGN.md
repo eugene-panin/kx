@@ -1,41 +1,44 @@
-# kx — управление зоопарком kubeconfig'ов
+# kx design notes
 
-## Проблема
+## Problem
 
-N заказчиков, у каждого несколько кластеров. Проекты приходят и уходят.
-Работа идёт в Lens / k9s, которые читают `~/.kube/config`. Править его руками —
-мерджить чужие конфиги, разруливать конфликты имён `kubernetes`/`admin`,
-вычищать уехавших заказчиков — надоело.
+Several clients, each with a few clusters. Projects come and go. Day-to-day
+work happens in Lens and k9s, which read `~/.kube/config`. Editing that file by
+hand got old: merging configs people send, untangling `kubernetes`/`admin`
+name clashes, cleaning up after clients who left.
 
-## Идея
+## Idea
 
-Хранилище отдельно, `~/.kube/config` — генерируемый артефакт.
+Keep the clusters in a store of their own and treat `~/.kube/config` as a
+generated file.
 
 ```
 ~/.config/kx/
   clusters/
     acme/
-      prod.yaml        # самодостаточный kubeconfig: 1 cluster + 1 user + 1 context
+      prod.yaml        # self-contained kubeconfig: 1 cluster + 1 user + 1 context
       stage.yaml
     globex/
       main.yaml
-  state.yaml           # что выключено + что было сгенерировано в прошлый раз
-  backups/             # последние 10 версий ~/.kube/config
+  state.yaml           # what is turned off, plus what the last build generated
+  checks.json          # last check results
+  backups/             # the last 10 versions of ~/.kube/config
 
-~/.kube/config         # собирается из включённых кластеров
+~/.kube/config         # built from the clusters that are on
 ```
 
-- Главная сущность — **заказчик** (client). Кластер адресуется как `client/cluster`.
-- Контекст, cluster и user внутри называются одинаково: `acme/prod`. Конфликтов
-  имён при слиянии нет по построению.
-- Файл в хранилище самодостаточный: сертификаты из внешних файлов при импорте
-  встраиваются (`*-data`). Скачанный kubeconfig можно сразу удалять.
-  Каждый файл рабочий сам по себе: `KUBECONFIG=~/.config/kx/clusters/acme/prod.yaml kubectl ...`.
-- Выключенный кластер остаётся в хранилище, но в `~/.kube/config` не попадает —
-  Lens/k9s его не видят.
-- Выключить можно и заказчика целиком.
+- The main unit is the **client**. A cluster is addressed as `client/cluster`.
+- Inside each file the context, the cluster and the user all share one name,
+  `acme/prod`, so merging can't produce clashes.
+- Every file in the store is self-contained: certificates referenced as files
+  are inlined (`*-data`) on import, so the downloaded kubeconfig can be thrown
+  away. Each file works on its own:
+  `KUBECONFIG=~/.config/kx/clusters/acme/prod.yaml kubectl ...`.
+- A cluster that is turned off stays in the store but is left out of
+  `~/.kube/config`, so Lens and k9s don't see it.
+- A whole client can be turned off too.
 
-## Команды
+## Commands
 
 ```
 kx add <file|-> -c <client> [--name N] [--context C]... [--force]
@@ -52,129 +55,140 @@ kx import-current [-c unsorted]
 kx build [--force]
 ```
 
-| команда | что делает |
+| command | what it does |
 |---|---|
-| `add` | Разбивает входной kubeconfig на контексты, переименовывает в `client/<имя>`, встраивает файлы, кладёт в хранилище. `--context` — взять только указанные. `--name` — имя кластера (только если контекст один). Имя по умолчанию — исходное имя контекста, санитизированное (для EKS ARN берётся часть после последнего `/`). `--force` — перезаписать существующий. |
-| `ls` | Таблица `CLIENT CLUSTER SERVER NAMESPACE STATE`, `*` — текущий контекст. `--json` — для скриптов и агентов, без кредов. |
-| `use` | Выставить `current-context` — кластер, в который по умолчанию ходят kubectl/helm/k9s. Без аргумента — показать текущий. Меняет только это поле, без пересборки и бэкапа, чтобы частые переключения не вытесняли полезные бэкапы. Выключенный кластер сделать текущим нельзя; выключение или удаление текущего очищает `current-context`. |
-| `on`/`off` | Включить/выключить. `on acme/prod` при выключенном `acme` включает только prod. |
-| `rm` | Удалить. Удаление заказчика целиком спрашивает подтверждение (`-y` — без). |
-| `mv` | `mv acme/old acme/new` — переименовать кластер; `mv unsorted/x acme` — перенести к заказчику; `mv acme acme-corp` — переименовать заказчика. |
-| `export` | Собрать kubeconfig из указанных кластеров в stdout (включая выключенные). |
-| `exec` | Запустить команду с `KUBECONFIG` на временный файл только с указанными кластерами (выключенные тоже). Первый — текущий. Ставит `KX_SCOPE`. Код выхода — как у команды. Временный файл удаляется после выхода. |
-| `check` | Параллельно по каждому кластеру: `/version` (доступность, версия) → `SelfSubjectReview` (креды работают, под кем; на <1.28 — `GET /api`) → `/readyz?verbose` (HEALTH: `ok`/`degraded` + что упало; на <1.16 — `/healthz`) → ноды (NODES `ready/total`, через Table-формат — пара сотен байт на ноду). Срок жизни клиентского сертификата / JWT читается локально. Нет прав на readyz/ноды — колонка пустая. По умолчанию — включённые кластеры. Exit 1, если хоть один не `ok` или `degraded`. Ошибки, упавшие проверки readyz и устаревшие версии — под таблицей. Результаты запоминаются в `checks.json`. |
-| `import-current` | Забрать под управление все контексты из `~/.kube/config`, которых нет в хранилище, к заказчику `-c` (по умолчанию `unsorted`). Дальше раскидать через `mv`. |
-| `build` | Пересобрать `~/.kube/config`. Все изменяющие команды делают это сами. |
+| `add` | Splits the input kubeconfig into contexts, renames them to `client/<name>`, inlines files and puts them in the store. `--context` takes only the named ones. `--name` sets the cluster name (single context only). By default the name is the original context name, sanitized (for an EKS ARN, the part after the last `/`). `--force` overwrites an existing cluster. |
+| `ls` | Table of `CLIENT CLUSTER SERVER NAMESPACE VERSION STATE`, `*` marks the current context. VERSION comes from the last check. `--json` for scripts and agents, no credentials. |
+| `use` | Sets `current-context`, the cluster kubectl, helm and k9s talk to by default. Without an argument prints the current one. Only that one field is rewritten, with no rebuild and no backup, so switching back and forth doesn't push useful backups out. A cluster that is off can't be made current; turning off or removing the current cluster clears `current-context`. |
+| `on`/`off` | Turn on or off. `on acme/prod` while `acme` is off turns on prod only. |
+| `rm` | Remove. Removing more than one cluster asks first (`-y` skips the question). |
+| `mv` | `mv acme/old acme/new` renames a cluster, `mv unsorted/x acme` moves it to a client, `mv acme acme-corp` renames a client. |
+| `export` | Prints a kubeconfig with the given clusters to stdout, including ones that are off. |
+| `exec` | Runs a command with `KUBECONFIG` pointing at a temporary file holding just the given clusters (including ones that are off). The first one is current. Sets `KX_SCOPE`. Exits with the command's exit code. The temporary file is removed afterwards. |
+| `check` | For each cluster, in parallel: `/version` (reachable, version), then `SelfSubjectReview` (credentials work, as whom; `GET /api` before 1.28), then `/readyz?verbose` (HEALTH `ok`/`degraded` plus what failed; `/healthz` before 1.16), then nodes (NODES `ready/total`, using the Table rendering, a few hundred bytes per node). Client certificate and JWT expiry is read locally. No permission for readyz or nodes leaves the column empty. Checks the clusters that are on by default. Exits 1 if any cluster is down or degraded. Errors, failed readyz checks and outdated versions are listed under the table. Results are saved to `checks.json`. |
+| `import-current` | Takes over every context in `~/.kube/config` that isn't in the store, under client `-c` (`unsorted` by default). Sort them out with `mv` afterwards. |
+| `build` | Rebuilds `~/.kube/config`. Every command that changes something does this on its own. |
 
-## Вывод
+## Output
 
-- В терминале: цвет (базовые ANSI-цвета, подстраиваются под тему), `ls`
-  группирует кластеры по заказчику, таблицы подгоняются под ширину окна:
-  1. второстепенные значения (SERVER, USER) подрезаются с `…`, но не больше чем на треть;
-  2. не хватило — прячутся второстепенные колонки (NAMESPACE; LATENCY → VERSION → USER);
-  3. не хватило и этого — всё режется до минимальной ширины. Имена кластеров — последними.
-  Ошибки `check` — под таблицей, перенос по словам с отступом.
-- В pipe / не-TTY / `NO_COLOR`: плоская таблица без цвета и обрезки,
-  `ls` — с заказчиком в каждой строке, чтобы работал grep. Для машин — `--json`.
-- Ширина берётся в момент вывода. Уже напечатанное при ресайзе переносит сам
-  терминал; перестраиваться на лету сможет только полноэкранный TUI.
+- On a terminal: color (basic ANSI colors, so they follow the terminal theme),
+  `ls` groups clusters by client, and tables are fitted to the window width:
+  1. secondary values (SERVER, USER) are cut with `…`, by a third at most;
+  2. if that's not enough, secondary columns are hidden (NAMESPACE; LATENCY,
+     then VERSION, then USER);
+  3. if even that's not enough, everything is cut down to its minimum width.
+     Cluster names go last.
+  `check` errors are printed under the table, word-wrapped and indented.
+- In a pipe, without a TTY or with `NO_COLOR`: a flat table with no color and
+  no truncation. `ls` repeats the client on every line so grep works. Machines
+  should use `--json`.
+- The width is read when the output is printed. Once printed, the terminal
+  rewraps lines on resize; only the full-screen mode can relayout live.
 
-## Защита от потери чужих контекстов
+## Not losing other people's contexts
 
-`aws eks update-kubeconfig`, `yc managed-kubernetes cluster get-credentials` и т.п.
-пишут прямо в `~/.kube/config`. Чтобы пересборка их молча не затёрла:
+`aws eks update-kubeconfig`, `yc managed-kubernetes cluster get-credentials`
+and similar tools write straight into `~/.kube/config`. So that a rebuild
+doesn't silently wipe their work:
 
-- в `state.yaml` хранится список контекстов, сгенерированных в прошлый раз;
-- перед любым изменением kx проверяет, нет ли в `~/.kube/config` контекстов,
-  которых нет ни в хранилище, ни в этом списке;
-- если есть — ошибка с предложением `kx import-current -c <client>`
-  или `kx build --force` (выбросить их).
+- `state.yaml` keeps the list of contexts the last build generated;
+- before any change kx checks `~/.kube/config` for contexts that are neither
+  in the store nor on that list;
+- if there are any, it stops and suggests `kx import-current -c <client>` or
+  `kx build --force` (drop them).
 
-Перед каждой перезаписью `~/.kube/config` старая версия кладётся в `backups/`.
-Запись атомарная (tmp + rename), права 0600. Если содержимое не изменилось — файл не трогается.
+Before every rewrite of `~/.kube/config` the old version goes to `backups/`.
+Writes are atomic (temp file plus rename) with mode 0600. If the content
+didn't change, the file isn't touched.
 
-`current-context` сохраняется при пересборке, если такой контекст всё ещё есть.
+`current-context` survives a rebuild as long as that context still exists.
 
-Namespace, переключённый в `~/.kube/config` сторонними тулзами (k9s, kubens,
-`kubectl config set-context`), перед каждым изменением забирается обратно в
-хранилище — переживает пересборку и `off`/`on`.
+A namespace switched in `~/.kube/config` by other tools (k9s, kubens,
+`kubectl config set-context`) is copied back into the store before every
+change, so it survives rebuilds and `off`/`on`.
 
-## Интерактивный режим
+## Interactive mode
 
-`kx` без аргументов в терминале (или `kx ui`) — полноэкранный TUI на
-bubbletea. В pipe `kx` без аргументов печатает help.
+`kx` with no arguments on a terminal (or `kx ui`) opens a full-screen
+bubbletea UI. In a pipe, plain `kx` prints help.
 
-Главный сценарий — «прислали конфиг → подкинул → Lens подхватил»:
+The main use case is "someone sent a config, I drop it in, Lens picks it up":
 
-- `p` — kubeconfig из буфера обмена (pbpaste / wl-paste / xclip / xsel),
-  потом заказчик (подставлен текущий). Конфиг, присланный текстом в мессенджере,
-  добавляется в два нажатия.
-- `a` — kubeconfig из файла. Файл можно перетащить из Finder в терминал:
-  кавычки и экранированные пробелы в пути разбираются.
-- `enter` — сделать кластер текущим (`current-context`, отмечен `*`).
-- `space` — вкл/выкл кластер или заказчика целиком; `r` — переименовать;
-  `d` — удалить (с подтверждением); `i` — импорт чужих контекстов из `~/.kube/config`.
-- Дерево «заказчик → кластеры», фильтр `/` по имени и серверу.
-- `c` — check видимых кластеров, статусы появляются по мере ответа; детали
-  выбранного (статус, ошибка, версия, пользователь, срок, сервер) — в строке внизу.
-- Вёрстка перестраивается на лету при изменении размера окна — по тем же
-  правилам, что и `ls`/`check`.
-- Действия вызывают те же функции, что и CLI, поэтому защита от потери чужих
-  контекстов, бэкапы и синхронизация namespace работают одинаково.
-- Пока TUI открыт, `os.Stderr` перенаправлен в `/dev/null`: exec-плагины
-  авторизации пишут туда напрямую и ломали бы экран.
+- `p` reads a kubeconfig from the clipboard (pbpaste, wl-paste, xclip or
+  xsel), then asks for the client (the selected one is prefilled). A config
+  pasted in chat goes in with two key presses.
+- `a` reads a kubeconfig from a file. The file can be dragged from Finder into
+  the terminal: quotes and escaped spaces in the path are handled.
+- `enter` makes a cluster current (`current-context`, marked `*`).
+- `space` turns a cluster or a whole client on or off, `r` renames, `d`
+  deletes (asks first), `i` imports foreign contexts from `~/.kube/config`.
+- Clusters are shown as a client/cluster tree; `/` filters by name and server.
+- `c` checks the clusters on screen. Statuses show up as clusters answer; the
+  details of the selected one (status, error, version, user, expiry, server)
+  are on the line at the bottom.
+- The layout follows window resizes live, using the same rules as `ls` and
+  `check`.
+- Actions call the same code as the CLI, so foreign-context protection,
+  backups and namespace sync behave the same.
+- While the UI is open, `os.Stderr` points at `/dev/null`: exec auth plugins
+  write there directly and would garble the screen.
 
-## Состояние кластеров
+## Cluster state
 
-- Результаты последней проверки лежат в `~/.config/kx/checks.json`. `ls` показывает
-  по ним VERSION, TUI при открытии — версию и статус (приглушённо, с «checked
-  2h ago» в строке деталей), не опрашивая кластеры заново. Удалённые кластеры
-  из кэша вычищаются при следующем сохранении.
-- Устаревшие версии: upstream поддерживает три последних минорных релиза.
-  Без похода в интернет «последний» — самая свежая версия среди своих
-  кластеров; всё, что отстаёт на 3+ минорных, помечается `!` и объясняется под
-  таблицей. С одним кластером флаг не срабатывает никогда — это осознанно.
+- The last check results live in `~/.config/kx/checks.json`. `ls` takes
+  VERSION from there; the interactive mode shows version and status on start
+  (muted, with "checked 2h ago" on the details line) without asking the
+  clusters again. Removed clusters are dropped from the cache on the next
+  save.
+- Outdated versions: upstream supports the three latest minor releases. With
+  no network lookup, "latest" means the newest version among your own
+  clusters; anything three or more minors behind gets a `!` and an explanation
+  under the table. With a single cluster the flag never fires, on purpose.
 
-## Агенты
+## Agents
 
-Агенту не нужен весь зоопарк: `kx exec acme -- <агент>` — и он видит только
-кластеры `acme`, промахнуться в прод другого заказчика нельзя. Это защита от
-ошибок, а не песочница: `~/.kube/config` и хранилище остаются читаемыми.
+An agent doesn't need the whole zoo: with `kx exec acme -- <agent>` it only
+sees `acme` clusters and can't stumble into another client's production. This
+guards against mistakes; it is not a sandbox, since `~/.kube/config` and the
+store are still readable.
 
-Для машинного разбора — `kx ls --json`. Единственный интерактивный вопрос —
-подтверждение `rm` нескольких кластеров: `-y` его снимает, а без ответа
-команда падает с ошибкой, а не висит.
+`kx ls --json` is there for parsing. The only interactive question is the
+confirmation for removing several clusters: `-y` skips it, and with no answer
+the command fails instead of hanging.
 
-MCP-сервер пока не делаем. Если появится — без `export`: креды не должны
-попадать в контекст модели.
+No MCP server for now. If one shows up, it won't have `export`: credentials
+shouldn't end up in a model's context.
 
-## Окружение
+## Environment
 
-- `KX_HOME` — хранилище (по умолчанию `$XDG_CONFIG_HOME/kx` или `~/.config/kx`).
-- `KX_KUBECONFIG` — куда собирать (по умолчанию `~/.kube/config`).
+- `KX_HOME`: the store (default `$XDG_CONFIG_HOME/kx` or `~/.config/kx`).
+- `KX_KUBECONFIG`: the file to build (default `~/.kube/config`).
 
-## Код
+## Code
 
 ```
-main.go              cobra: разбор команд и флагов, автодополнение
-internal/app/        команды kx (add, on/off, rm, mv, use, export, exec, check, build) — общие для CLI и TUI
-internal/store/      хранилище: кластеры, state.yaml, разбор/слияние kubeconfig, атомарная запись
-internal/probe/      проверка кластера: version, whoami, readyz, ноды, сроки кредов, политика версий, кэш
-internal/table/      таблицы: цвет, подгонка под ширину
-internal/tui/        интерактивный режим
-internal/kxtest/     фикстуры для тестов: окружение, kubeconfig, фейковый API-сервер
+main.go              cobra: commands, flags, completion
+internal/app/        kx commands (add, on/off, rm, mv, use, export, exec, check, build), shared by CLI and TUI
+internal/store/      the store: clusters, state.yaml, kubeconfig parsing and merging, atomic writes
+internal/probe/      cluster checks: version, whoami, readyz, nodes, credential expiry, version policy, cache
+internal/table/      tables: color, fitting to width
+internal/tui/        interactive mode
+internal/kxtest/     test fixtures: environment, kubeconfig, fake API server
 ```
 
-`main.go` лежит в корне, чтобы `go install github.com/eugene-panin/kx@latest`
-давал бинарник `kx`. E2E-тесты CLI — в `main_test.go`, остальные — рядом с пакетами.
+`main.go` sits at the root so that `go install github.com/eugene-panin/kx@latest`
+produces a `kx` binary. CLI end-to-end tests are in `main_test.go`, the rest
+live next to their packages.
 
-## Стек
+## Stack
 
-Go, `cobra`, `k8s.io/client-go/tools/clientcmd` (загрузка, резолв относительных
-путей, flatten, запись — exec-плагины и прочие поля переносятся как есть).
+Go, `cobra`, `k8s.io/client-go/tools/clientcmd` (loading, resolving relative
+paths, flattening, writing; exec plugins and other fields are carried over
+as is), bubbletea and lipgloss for the interactive mode and colors.
 
-## Не в первой версии
+## Not done yet
 
-- `kx ns` — переключение namespace (пока это делают k9s/kubens).
-- Раздельный контекст на каждый шелл (частично закрывается `kx exec <client> -- $SHELL`).
-- Автоимпорт из облаков (`kx sync aws|yc|do`).
+- `kx ns` to switch namespaces (k9s and kubens do it for now).
+- A separate current context per shell (`kx exec <client> -- $SHELL` covers
+  part of it).
+- Importing straight from clouds (`kx sync aws|yc|do`).
