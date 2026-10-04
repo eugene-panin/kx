@@ -84,6 +84,8 @@ const (
 
 type (
 	loadedMsg struct {
+		synced  []string // what Sync took from the target
+		stamp   stamp
 		rows    []app.ListRow
 		checks  map[string]probe.Result
 		st      *store.State
@@ -96,6 +98,7 @@ type (
 		added  []store.Ref // clusters to check and select once reloaded
 	}
 	checkMsg struct{ res probe.Result }
+	watchMsg struct{}
 	savedMsg struct{ err error }
 )
 
@@ -124,7 +127,11 @@ type model struct {
 	status  string
 	failed  bool
 	busy    bool
-	focus   string // select this item after the next reload
+	notice  bool // status is a warning rather than a result
+
+	stamp      stamp         // the target as last loaded
+	watchEvery time.Duration // how often to look for hand edits of the target
+	focus      string        // select this item after the next reload
 
 	checks   map[string]probe.Result // this session's and remembered ones
 	checking map[string]bool
@@ -145,17 +152,18 @@ func newModel(a *app.App) model {
 	sp := spinner.New()
 	sp.Spinner = spinner.MiniDot
 	return model{
-		a:         a,
-		o:         table.New(a.Stdout),
-		input:     in,
-		checks:    map[string]probe.Result{},
-		checking:  map[string]bool{},
-		started:   time.Now(),
-		sem:       make(chan struct{}, probe.Parallel),
-		timeout:   probe.Timeout,
-		spin:      sp,
-		help:      help.New(),
-		clipboard: readClipboard,
+		a:          a,
+		o:          table.New(a.Stdout),
+		input:      in,
+		checks:     map[string]probe.Result{},
+		checking:   map[string]bool{},
+		started:    time.Now(),
+		sem:        make(chan struct{}, probe.Parallel),
+		timeout:    probe.Timeout,
+		spin:       sp,
+		help:       help.New(),
+		clipboard:  readClipboard,
+		watchEvery: 2 * time.Second,
 	}
 }
 
@@ -176,11 +184,38 @@ func Run(a *app.App) error {
 	return err
 }
 
-func (m model) Init() tea.Cmd { return m.load() }
+func (m model) Init() tea.Cmd { return tea.Batch(m.load(), m.watch()) }
 
+// stamp identifies a version of the target file well enough to notice edits.
+type stamp struct {
+	mod  time.Time
+	size int64
+}
+
+func stampOf(path string) stamp {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return stamp{}
+	}
+	return stamp{fi.ModTime(), fi.Size()}
+}
+
+// watch schedules the next look at the target; zero watchEvery turns it off.
+func (m model) watch() tea.Cmd {
+	if m.watchEvery == 0 {
+		return nil
+	}
+	return tea.Tick(m.watchEvery, func(time.Time) tea.Msg { return watchMsg{} })
+}
+
+// load takes hand edits of the target in, then reads everything shown.
 func (m model) load() tea.Cmd {
 	a := m.a
 	return func() tea.Msg {
+		notes, err := a.Sync()
+		if err != nil {
+			return loadedMsg{err: err}
+		}
 		rows, st, err := a.Rows()
 		if err != nil {
 			return loadedMsg{err: err}
@@ -190,7 +225,7 @@ func (m model) load() tea.Cmd {
 			return loadedMsg{err: err}
 		}
 		foreign, err := a.Unmanaged()
-		return loadedMsg{rows: rows, checks: checks, st: st, foreign: foreign, err: err}
+		return loadedMsg{rows: rows, checks: checks, st: st, foreign: foreign, synced: notes, stamp: stampOf(a.Target), err: err}
 	}
 }
 
@@ -267,7 +302,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.focus != "" {
 			sel, m.focus = m.focus, ""
 		}
-		m.rows, m.st, m.foreign = msg.rows, msg.st, msg.foreign
+		m.rows, m.st, m.foreign, m.stamp = msg.rows, msg.st, msg.foreign, msg.stamp
+		if len(msg.synced) > 0 {
+			m.status, m.failed, m.notice = summarize(strings.Join(msg.synced, "\n")), false, true
+		}
 		for ctx, res := range msg.checks {
 			if _, have := m.checks[ctx]; !have {
 				m.checks[ctx] = res
@@ -285,6 +323,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.focus = msg.added[0].String()
 		return m, tea.Batch(m.load(), m.probeRefs(msg.added))
+	case watchMsg:
+		if !m.busy && stampOf(m.a.Target) != m.stamp {
+			return m, tea.Batch(m.load(), m.watch())
+		}
+		return m, m.watch()
 	case checkMsg:
 		delete(m.checking, msg.res.Context)
 		m.checks[msg.res.Context] = msg.res
@@ -311,7 +354,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	m.status, m.failed = "", false
+	m.status, m.failed, m.notice = "", false, false
 	switch {
 	case key.Matches(msg, keys.Quit):
 		return m, tea.Quit
@@ -788,10 +831,12 @@ func (m model) statusLine(o *table.Output) string {
 	switch {
 	case m.status != "" && m.failed:
 		return o.Paint(o.Bad, m.status)
+	case m.status != "" && m.notice:
+		return o.Paint(o.Warn, m.status)
 	case m.status != "":
 		return o.Paint(o.OK, m.status)
 	case len(m.foreign) > 0:
-		return o.Paint(o.Warn, fmt.Sprintf("%d unmanaged contexts, i imports them into unsorted (%s)", len(m.foreign), tildify(m.a.Target)))
+		return o.Paint(o.Warn, fmt.Sprintf("%d unmanaged contexts, i imports them into unsorted (%s)", len(m.foreign), m.a.TargetName()))
 	}
 	return ""
 }
@@ -799,15 +844,6 @@ func (m model) statusLine(o *table.Output) string {
 func firstLine(err error) string {
 	s, _, _ := strings.Cut(err.Error(), "\n")
 	return s
-}
-
-func tildify(p string) string {
-	if home, err := os.UserHomeDir(); err == nil {
-		if rest, ok := strings.CutPrefix(p, home+string(filepath.Separator)); ok {
-			return "~/" + rest
-		}
-	}
-	return p
 }
 
 func expandHome(p string) string {

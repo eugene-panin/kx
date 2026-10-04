@@ -118,6 +118,7 @@ func newTUI(t *testing.T, e *env, width, height int) tea.Model {
 
 func startTUI(t *testing.T, m model, width, height int) tea.Model {
 	t.Helper()
+	m.watchEvery = 0 // tests deliver watchMsg themselves instead of waiting on a timer
 	return drive(t, m, m.Init()(), tea.WindowSizeMsg{Width: width, Height: height})
 }
 
@@ -362,6 +363,39 @@ func TestTUIRemembersChecks(t *testing.T) {
 	checks, err := probe.LoadCache(filepath.Join(e.Home, "checks.json"))
 	if err != nil || checks["acme/prod"].Status != "unreachable" {
 		t.Errorf("saved result = %+v, %v", checks["acme/prod"], err)
+	}
+}
+
+func TestTUIWatchesTarget(t *testing.T) {
+	e := newEnv(t)
+	e.ok("add", e.Kubeconfig("a.yaml", "https://a"), "-c", "acme", "-n", "prod")
+	e.ok("add", e.Kubeconfig("b.yaml", "https://b"), "-c", "acme", "-n", "stage")
+	m := newTUI(t, e, 120, 20)
+
+	// Nothing changed: a watch tick does nothing visible.
+	m = drive(t, m, watchMsg{})
+	if st := m.(model).status; st != "" {
+		t.Fatalf("status after an idle tick = %q", st)
+	}
+
+	cfg, err := clientcmd.LoadFromFile(e.Target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delete(cfg.Contexts, "acme/stage")
+	// Make sure the stamp differs even on filesystems with coarse mtimes.
+	cfg.Preferences.Colors = true
+	if err := clientcmd.WriteToFile(*cfg, e.Target); err != nil {
+		t.Fatal(err)
+	}
+	m = drive(t, m, watchMsg{})
+	if st := m.(model).status; !strings.Contains(st, "acme/stage: removed from") {
+		t.Errorf("status = %q", st)
+	}
+	for _, it := range m.(model).items {
+		if it.row != nil && it.row.Context == "acme/stage" && it.row.Enabled {
+			t.Error("acme/stage still on after it was deleted by hand")
+		}
 	}
 }
 

@@ -91,7 +91,7 @@ func (a *App) ImportCurrent(client string) error {
 	if !store.ValidName(client) {
 		return fmt.Errorf("invalid client name %q", client)
 	}
-	if err := a.syncNamespaces(); err != nil {
+	if err := a.SyncAndReport(); err != nil {
 		return err
 	}
 	names, err := a.Unmanaged()

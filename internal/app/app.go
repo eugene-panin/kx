@@ -113,40 +113,16 @@ func (a *App) prepare() error {
 	if err := a.checkTarget(); err != nil {
 		return err
 	}
-	return a.syncNamespaces()
+	return a.SyncAndReport()
 }
 
-// syncNamespaces copies namespaces switched in the target (k9s, kubens,
-// kubectl config set-context) back into the store, so a rebuild keeps them
-// and they survive off/on.
-func (a *App) syncNamespaces() error {
-	cur, err := a.loadTarget()
-	if err != nil {
-		return err
+// SyncAndReport runs Sync and tells about the changes on Stderr.
+func (a *App) SyncAndReport() error {
+	notes, err := a.Sync()
+	for _, n := range notes {
+		fmt.Fprintln(a.Stderr, "kx:", n)
 	}
-	refs, err := a.Store.Clusters()
-	if err != nil {
-		return err
-	}
-	for _, r := range refs {
-		tc := cur.Contexts[r.String()]
-		if tc == nil {
-			continue
-		}
-		cfg, err := a.Store.Get(r)
-		if err != nil {
-			return err
-		}
-		sc := cfg.Contexts[r.String()]
-		if sc == nil || sc.Namespace == tc.Namespace {
-			continue
-		}
-		sc.Namespace = tc.Namespace
-		if err := a.Store.Put(r, cfg); err != nil {
-			return err
-		}
-	}
-	return nil
+	return err
 }
 
 // Build regenerates the target. renames maps old context names to new ones so
@@ -240,10 +216,10 @@ func (a *App) backup(data []byte) error {
 	return nil
 }
 
-// Rebuild is `kx build`: pull namespace switches in and regenerate the target.
+// Rebuild is `kx build`: pull hand edits in and regenerate the target.
 // With force the target may be unreadable, so namespaces are best effort then.
 func (a *App) Rebuild(force bool) error {
-	if err := a.syncNamespaces(); err != nil && !force {
+	if err := a.SyncAndReport(); err != nil && !force {
 		return err
 	}
 	return a.Build(force, nil)

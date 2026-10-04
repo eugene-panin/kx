@@ -53,6 +53,7 @@ kx export <client|client/cluster>...
 kx exec <client|client/cluster>... -- <command> [args...]
 kx check [client|client/cluster]... [--all] [--json] [--timeout 10s]
 kx import-current [-c unsorted]
+kx sync
 kx build [--force]
 ```
 
@@ -69,6 +70,7 @@ kx build [--force]
 | `exec` | Runs a command with `KUBECONFIG` pointing at a temporary file holding just the given clusters (including ones that are off). The first one is current. Sets `KX_SCOPE`. Exits with the command's exit code. The temporary file is removed afterwards. |
 | `check` | For each cluster, in parallel: `/version` (reachable, version), then `SelfSubjectReview` (credentials work, as whom; `GET /api` before 1.28), then `/readyz?verbose` (HEALTH `ok`/`degraded` plus what failed; `/healthz` before 1.16), then nodes (NODES `ready/total`, using the Table rendering, a few hundred bytes per node). Client certificate and JWT expiry is read locally. No permission for readyz or nodes leaves the column empty. Checks the clusters that are on by default. Exits 1 if any cluster is down or degraded. Errors, failed readyz checks and outdated versions are listed under the table. Results are saved to `checks.json`. |
 | `import-current` | Takes over every context in `~/.kube/config` that isn't in the store, under client `-c` (`unsorted` by default). Sort them out with `mv` afterwards. |
+| `sync` | Takes hand edits of `~/.kube/config` into the store (see below). Every command does this first; `sync` runs it alone. |
 | `build` | Rebuilds `~/.kube/config`. Every command that changes something does this on its own. |
 
 ## Output
@@ -105,9 +107,26 @@ didn't change, the file isn't touched.
 
 `current-context` survives a rebuild as long as that context still exists.
 
-A namespace switched in `~/.kube/config` by other tools (k9s, kubens,
-`kubectl config set-context`) is copied back into the store before every
-change, so it survives rebuilds and `off`/`on`.
+## Hand edits of the target
+
+The store is kx's own; `~/.kube/config` is where people and other tools
+make changes. kx treats such a change as deliberate and takes it in, instead
+of undoing it on the next rebuild:
+
+- a managed context whose cluster, credentials or namespace differ from the
+  store replaces the stored copy (the context is re-extracted from the target,
+  so file references are inlined as on import). Cluster and credential changes
+  are reported; namespace switches (k9s, kubens) are taken silently;
+- a managed context that the last build wrote but that is gone now is turned
+  off, not removed, and reported. `kx on` brings it back;
+- if the whole file is gone, that's a reset rather than a list of deletions:
+  nothing is turned off and the next build writes everything again;
+- contexts kx doesn't manage are left alone (see above).
+
+This runs before every command (a failure is only a warning, so a broken file
+doesn't block `kx build --force`), at the start of the interactive mode, and
+whenever the interactive mode sees the file change (it looks every two
+seconds). `kx sync` runs it on its own.
 
 ## Interactive mode
 
@@ -134,7 +153,9 @@ The main use case is "someone sent a config, I drop it in, Lens picks it up":
 - The layout follows window resizes live, using the same rules as `ls` and
   `check`.
 - Actions call the same code as the CLI, so foreign-context protection,
-  backups and namespace sync behave the same.
+  backups and syncing hand edits behave the same. Hand edits made while the
+  view is open are picked up within a couple of seconds and shown on the
+  status line.
 - While the UI is open, `os.Stderr` points at `/dev/null`: exec auth plugins
   write there directly and would garble the screen.
 

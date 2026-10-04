@@ -15,6 +15,7 @@ import (
 	"github.com/eugene-panin/kx/internal/probe"
 	"github.com/eugene-panin/kx/internal/store"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/tools/clientcmd/api"
 )
 
 // kxtest.Kubeadm-style kubeconfig: every cluster built this way has the same
@@ -421,13 +422,13 @@ func TestCheck(t *testing.T) {
 	e.ok("add", e.Kubeconfig("slow.yaml", slow.URL), "-c", "acme", "-n", "slow")
 	e.ok("add", e.Kubeconfig("gone.yaml", gone.URL), "-c", "acme", "-n", "gone")
 	e.ok("add", e.Kubeconfig("bad.yaml", ok.URL), "-c", "acme", "-n", "badtoken")
-	stored := filepath.Join(e.Home, "clusters", "acme", "badtoken.yaml")
-	cfg, err := clientcmd.LoadFromFile(stored)
+	// A token changed by hand in ~/.kube/config is what check must use.
+	cfg, err := clientcmd.LoadFromFile(e.Target)
 	if err != nil {
 		t.Fatal(err)
 	}
 	cfg.AuthInfos["acme/badtoken"].Token = "wrong"
-	if err := clientcmd.WriteToFile(*cfg, stored); err != nil {
+	if err := clientcmd.WriteToFile(*cfg, e.Target); err != nil {
 		t.Fatal(err)
 	}
 	e.ok("off", "acme/old")
@@ -621,5 +622,93 @@ func TestAddCheck(t *testing.T) {
 	checks, err := probe.LoadCache(filepath.Join(e.Home, "checks.json"))
 	if err != nil || checks["acme/stale"].Status != "unauthorized" || checks["acme/prod"].Status != "ok" {
 		t.Errorf("saved checks = %+v, %v", checks, err)
+	}
+}
+
+// editTarget changes ~/.kube/config the way a person or another tool would.
+func editTarget(t *testing.T, e *env, edit func(*api.Config)) {
+	t.Helper()
+	cfg, err := clientcmd.LoadFromFile(e.Target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	edit(cfg)
+	if err := clientcmd.WriteToFile(*cfg, e.Target); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSyncTakesHandEdits(t *testing.T) {
+	e := newEnv(t)
+	e.ok("add", e.Kubeconfig("a.yaml", "https://a"), "-c", "acme", "-n", "prod")
+	e.ok("add", e.Kubeconfig("b.yaml", "https://b"), "-c", "acme", "-n", "stage")
+	e.ok("add", e.Kubeconfig("c.yaml", "https://c"), "-c", "globex", "-n", "main")
+
+	editTarget(t, e, func(cfg *api.Config) {
+		cfg.Clusters["acme/prod"].Server = "https://moved:6443"
+		cfg.AuthInfos["acme/prod"].Token = "rotated"
+		delete(cfg.Contexts, "acme/stage")
+		cfg.Contexts["globex/main"].Namespace = "web"
+	})
+
+	out := e.ok("ls")
+	for _, want := range []string{
+		"acme/prod: took cluster and credentials from",
+		"acme/stage: removed from",
+		"by hand, turned off",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("ls output lacks %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "globex/main: took") {
+		t.Errorf("a namespace switch is reported:\n%s", out)
+	}
+
+	stored, err := clientcmd.LoadFromFile(filepath.Join(e.Home, "clusters", "acme", "prod.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Clusters["acme/prod"].Server != "https://moved:6443" || stored.AuthInfos["acme/prod"].Token != "rotated" {
+		t.Errorf("store not updated: %+v %+v", stored.Clusters["acme/prod"], stored.AuthInfos["acme/prod"])
+	}
+	if ns := stored.Contexts["acme/prod"].Namespace; ns != "" {
+		t.Errorf("unrelated namespace changed: %q", ns)
+	}
+
+	// The removed cluster is off, not gone, and the edits survive a rebuild.
+	e.ok("on", "acme/stage")
+	e.WantContexts("acme/prod", "acme/stage", "globex/main")
+	cfg, _ := clientcmd.LoadFromFile(e.Target)
+	if cfg.Clusters["acme/prod"].Server != "https://moved:6443" || cfg.Contexts["globex/main"].Namespace != "web" {
+		t.Error("a rebuild undid the hand edits")
+	}
+	if out := strings.TrimSpace(e.ok("sync")); out != "nothing to sync" {
+		t.Errorf("second sync = %q", out)
+	}
+}
+
+func TestSyncAfterTargetIsGone(t *testing.T) {
+	e := newEnv(t)
+	e.ok("add", e.Kubeconfig("a.yaml", "https://a"), "-c", "acme", "-n", "prod")
+	if err := os.Remove(e.Target); err != nil {
+		t.Fatal(err)
+	}
+	if out := e.ok("ls"); strings.Contains(out, "turned off") {
+		t.Errorf("a deleted file turned clusters off:\n%s", out)
+	}
+	e.ok("build")
+	e.WantContexts("acme/prod")
+}
+
+func TestBrokenTargetDoesNotBlockReads(t *testing.T) {
+	e := newEnv(t)
+	e.ok("add", e.Kubeconfig("a.yaml", "https://a"), "-c", "acme", "-n", "prod")
+	if err := os.WriteFile(e.Target, []byte("not: [yaml"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out := e.ok("ls")
+	if !strings.Contains(out, "kx: sync with") || !strings.Contains(out, "prod") {
+		t.Errorf("ls with a broken target:\n%s", out)
 	}
 }

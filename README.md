@@ -220,6 +220,12 @@ kx owns `~/.kube/config` and rebuilds it from scratch, but:
   those contexts silently. `kx build --force` drops them on purpose.
 - Before every rewrite the old file is copied to `~/.config/kx/backups`. The
   last ten are kept.
+- If you edit `~/.kube/config` by hand, kx takes your edits instead of
+  undoing them. Changed a token, a certificate or a server address of a
+  cluster kx manages: kx copies it into its store and tells you so. Deleted
+  one of its contexts: kx turns that cluster off (not removes it, `kx on`
+  brings it back). This happens before every kx command, and the interactive
+  view notices edits while it's open. `kx sync` runs it on its own.
 - A namespace you switched in k9s or with kubens is not reset on the next
   rebuild.
 - The current context is kept. It is only cleared when that cluster is turned

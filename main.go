@@ -78,6 +78,18 @@ Clusters are addressed as <client>/<cluster>.`,
 			}
 			return tui.Run(a.App)
 		},
+		// Hand edits of ~/.kube/config are taken in before any command looks
+		// at the store. A broken file must not block kx build --force, so a
+		// failure here is only a warning.
+		PersistentPreRun: func(cmd *cobra.Command, args []string) {
+			switch cmd.Name() {
+			case "sync", "completion", "help", cobra.ShellCompRequestCmd, cobra.ShellCompNoDescRequestCmd:
+				return
+			}
+			if err := a.SyncAndReport(); err != nil {
+				fmt.Fprintln(a.Stderr, "kx: sync with", a.Target+":", err)
+			}
+		},
 	}
 
 	var (
@@ -283,6 +295,28 @@ under 30 days. Errors are listed below the table; --json has full details.`,
 		},
 	}
 
+	sync := &cobra.Command{
+		Use:   "sync",
+		Short: "Take hand edits of ~/.kube/config into kx",
+		Long: `Every kx command does this first; this runs it on its own.
+
+A context kx manages that was edited by hand (server, certificates, token,
+namespace) replaces the stored copy. One that was deleted by hand is turned
+off, not removed: kx on brings it back. Contexts kx doesn't manage are left
+alone; take them over with kx import-current.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			notes, err := a.Sync()
+			for _, n := range notes {
+				fmt.Fprintln(a.Stdout, n)
+			}
+			if err == nil && len(notes) == 0 {
+				fmt.Fprintln(a.Stdout, "nothing to sync")
+			}
+			return err
+		},
+	}
+
 	var buildForce bool
 	build := &cobra.Command{
 		Use:   "build",
@@ -294,7 +328,7 @@ under 30 days. Errors are listed below the table; --json has full details.`,
 	}
 	build.Flags().BoolVar(&buildForce, "force", false, "drop contexts kx does not manage")
 
-	root.AddCommand(add, importCurrent, ls, use, ns, on, off, rm, mv, export, execCmd, check, ui, build)
+	root.AddCommand(add, importCurrent, ls, use, ns, on, off, rm, mv, export, execCmd, check, sync, ui, build)
 	return root
 }
 
