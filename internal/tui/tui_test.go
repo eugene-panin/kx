@@ -169,6 +169,33 @@ func TestTUIUse(t *testing.T) {
 	}
 }
 
+func TestTUINamespace(t *testing.T) {
+	e := newEnv(t)
+	e.ok("add", e.Kubeconfig("a.yaml", "https://a"), "-c", "acme", "-n", "prod")
+	m := newTUI(t, e, 100, 20)
+
+	m = drive(t, m, keyMsg("n"))
+	if st := m.(model).status; !strings.Contains(st, "pick a cluster") {
+		t.Errorf("n on a client: status = %q", st)
+	}
+	m = drive(t, m, keyMsg("j"), keyMsg("n"))
+	if v := m.View(); !strings.Contains(v, "namespace for acme/prod: default") {
+		t.Fatalf("no namespace prompt:\n%s", v)
+	}
+	msgs := append([]tea.Msg{keyMsg("ctrl+u")}, typed("monitoring")...)
+	m = drive(t, m, append(msgs, keyMsg("enter"))...)
+	cfg, err := clientcmd.LoadFromFile(e.Target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ns := cfg.Contexts["acme/prod"].Namespace; ns != "monitoring" {
+		t.Errorf("namespace = %q", ns)
+	}
+	if v := ansi.Strip(m.View()); !strings.Contains(v, "monitoring") {
+		t.Errorf("view does not show the new namespace:\n%s", v)
+	}
+}
+
 func TestTUIFilterRenameDelete(t *testing.T) {
 	e := newEnv(t)
 	e.ok("add", e.Kubeconfig("a.yaml", "https://a"), "-c", "acme", "-n", "prod")

@@ -74,6 +74,7 @@ window. Lens picks up the new cluster on its own.
 | `a` | add a kubeconfig from a file |
 | `space` | turn a cluster on or off; on a client line, all of its clusters |
 | `enter` | make the cluster current (`current-context`) |
+| `n` | set the cluster's default namespace |
 | `c` | check the clusters on screen |
 | `r` | rename |
 | `d` | delete, asks first |
@@ -127,6 +128,17 @@ Pick the cluster kubectl and helm use by default:
 kx use acme/prod
 kx use              # show the current one
 ```
+
+Default namespace, so you don't have to type `-n` every time:
+
+```bash
+kx ns monitoring             # for the current cluster
+kx ns acme/prod monitoring   # for a given one, even if it's off
+kx ns                        # show it
+```
+
+kx doesn't ask the cluster whether that namespace exists, so this works
+offline. The namespace sticks when you turn the cluster off and on again.
 
 Send a config to a colleague or back to the client:
 

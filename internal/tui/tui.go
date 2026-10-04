@@ -27,33 +27,34 @@ import (
 )
 
 type keyMap struct {
-	Up, Down, Top, Bottom, PageUp, PageDown                              key.Binding
-	Use, Toggle, Paste, Add, Check, Rename, Delete, Import, Filter, Quit key.Binding
+	Up, Down, Top, Bottom, PageUp, PageDown                                         key.Binding
+	Use, Namespace, Toggle, Paste, Add, Check, Rename, Delete, Import, Filter, Quit key.Binding
 }
 
 func (k keyMap) ShortHelp() []key.Binding {
-	return []key.Binding{k.Use, k.Toggle, k.Paste, k.Add, k.Check, k.Rename, k.Delete, k.Filter, k.Quit}
+	return []key.Binding{k.Use, k.Namespace, k.Toggle, k.Paste, k.Add, k.Check, k.Rename, k.Delete, k.Filter, k.Quit}
 }
 
 func (k keyMap) FullHelp() [][]key.Binding { return [][]key.Binding{k.ShortHelp()} }
 
 var keys = keyMap{
-	Up:       key.NewBinding(key.WithKeys("up", "k")),
-	Down:     key.NewBinding(key.WithKeys("down", "j")),
-	Top:      key.NewBinding(key.WithKeys("home", "g")),
-	Bottom:   key.NewBinding(key.WithKeys("end", "G")),
-	PageUp:   key.NewBinding(key.WithKeys("pgup", "ctrl+b")),
-	PageDown: key.NewBinding(key.WithKeys("pgdown", "ctrl+f")),
-	Use:      key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "use")),
-	Toggle:   key.NewBinding(key.WithKeys(" "), key.WithHelp("space", "on/off")),
-	Check:    key.NewBinding(key.WithKeys("c"), key.WithHelp("c", "check")),
-	Paste:    key.NewBinding(key.WithKeys("p"), key.WithHelp("p", "paste")),
-	Add:      key.NewBinding(key.WithKeys("a"), key.WithHelp("a", "add")),
-	Rename:   key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "rename")),
-	Delete:   key.NewBinding(key.WithKeys("d"), key.WithHelp("d", "delete")),
-	Import:   key.NewBinding(key.WithKeys("i"), key.WithHelp("i", "import")),
-	Filter:   key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "filter")),
-	Quit:     key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit")),
+	Up:        key.NewBinding(key.WithKeys("up", "k")),
+	Down:      key.NewBinding(key.WithKeys("down", "j")),
+	Top:       key.NewBinding(key.WithKeys("home", "g")),
+	Bottom:    key.NewBinding(key.WithKeys("end", "G")),
+	PageUp:    key.NewBinding(key.WithKeys("pgup", "ctrl+b")),
+	PageDown:  key.NewBinding(key.WithKeys("pgdown", "ctrl+f")),
+	Use:       key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "use")),
+	Namespace: key.NewBinding(key.WithKeys("n"), key.WithHelp("n", "namespace")),
+	Toggle:    key.NewBinding(key.WithKeys(" "), key.WithHelp("space", "on/off")),
+	Check:     key.NewBinding(key.WithKeys("c"), key.WithHelp("c", "check")),
+	Paste:     key.NewBinding(key.WithKeys("p"), key.WithHelp("p", "paste")),
+	Add:       key.NewBinding(key.WithKeys("a"), key.WithHelp("a", "add")),
+	Rename:    key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "rename")),
+	Delete:    key.NewBinding(key.WithKeys("d"), key.WithHelp("d", "delete")),
+	Import:    key.NewBinding(key.WithKeys("i"), key.WithHelp("i", "import")),
+	Filter:    key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "filter")),
+	Quit:      key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit")),
 }
 
 // item is a line of the tree: a client header or one of its clusters.
@@ -78,6 +79,7 @@ const (
 	modeRename
 	modeAddPath
 	modeAddClient
+	modeNamespace
 )
 
 type (
@@ -356,6 +358,16 @@ func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		return m.mutate(func(q *app.App) error { return q.Use(ref) })
+	case key.Matches(msg, keys.Namespace):
+		if it.row == nil {
+			m.status, m.failed = "pick a cluster of "+it.client, true
+			return m, nil
+		}
+		ns := it.row.Namespace
+		if ns == "" {
+			ns = "default"
+		}
+		return m.prompt(modeNamespace, "namespace for "+ref+": ", ns)
 	case key.Matches(msg, keys.Toggle):
 		on := !m.enabled(it)
 		return m.mutate(func(q *app.App) error { return q.Toggle([]string{ref}, on) })
@@ -423,6 +435,13 @@ func (m model) updateInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 			m.addPath, m.addData = path, nil
 			return m.prompt(modeAddClient, fmt.Sprintf("client for %d contexts from %s: ", n, filepath.Base(path)), m.currentClient())
+		case modeNamespace:
+			it, ok := m.current()
+			if !ok || it.row == nil || val == "" {
+				return m, nil
+			}
+			ref := it.ref()
+			return m.mutate(func(q *app.App) error { return q.Namespace([]string{ref, val}) })
 		case modeAddClient:
 			if val == "" {
 				return m, nil
@@ -724,7 +743,7 @@ func (m model) detail(o *table.Output) string {
 
 func (m model) statusLine(o *table.Output) string {
 	switch m.mode {
-	case modeFilter, modeRename, modeAddPath, modeAddClient:
+	case modeFilter, modeRename, modeAddPath, modeAddClient, modeNamespace:
 		return m.input.View()
 	case modeConfirm:
 		it, _ := m.current()

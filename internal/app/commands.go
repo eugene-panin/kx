@@ -3,6 +3,7 @@ package app
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"github.com/eugene-panin/kx/internal/probe"
 	"github.com/eugene-panin/kx/internal/store"
 	"github.com/eugene-panin/kx/internal/table"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/clientcmd/api"
 )
@@ -477,6 +479,71 @@ func (a *App) Use(arg string) error {
 		}
 	}
 	fmt.Fprintf(a.Stdout, "using %s\n", r)
+	return nil
+}
+
+// Namespace prints or sets the default namespace of a context: the current
+// one, or the cluster named in args. Like Use it rewrites just that field of
+// the target, and the store too, so the namespace survives off/on.
+func (a *App) Namespace(args []string) error {
+	cfg, err := a.loadTarget()
+	if err != nil {
+		return err
+	}
+	var refArg, ns string
+	switch len(args) {
+	case 0:
+		ctx := cfg.Contexts[cfg.CurrentContext]
+		if ctx == nil {
+			return errors.New("no current context; pick one with kx use <client/cluster>")
+		}
+		ns = ctx.Namespace
+		if ns == "" {
+			ns = "default"
+		}
+		fmt.Fprintln(a.Stdout, ns)
+		return nil
+	case 1:
+		refArg, ns = cfg.CurrentContext, args[0]
+		if refArg == "" {
+			return errors.New("no current context; name the cluster: kx ns <client/cluster> <namespace>")
+		}
+	default:
+		refArg, ns = args[0], args[1]
+	}
+	if errs := validation.IsDNS1123Label(ns); len(errs) > 0 {
+		return fmt.Errorf("invalid namespace %q: %s", ns, strings.Join(errs, "; "))
+	}
+	r, err := store.ParseRef(refArg)
+	if err != nil {
+		return err
+	}
+	if r.Cluster == "" || !a.Store.Exists(r) {
+		return fmt.Errorf("%s: not a cluster kx manages", refArg)
+	}
+
+	stored, err := a.Store.Get(r)
+	if err != nil {
+		return err
+	}
+	if ctx := stored.Contexts[r.String()]; ctx != nil && ctx.Namespace != ns {
+		ctx.Namespace = ns
+		if err := a.Store.Put(r, stored); err != nil {
+			return err
+		}
+	}
+	// A cluster that is off is not in the target; the store is enough then.
+	if ctx := cfg.Contexts[r.String()]; ctx != nil && ctx.Namespace != ns {
+		ctx.Namespace = ns
+		data, err := clientcmd.Write(*cfg)
+		if err != nil {
+			return err
+		}
+		if err := store.WriteFile(a.Target, data); err != nil {
+			return err
+		}
+	}
+	fmt.Fprintf(a.Stdout, "%s: namespace %s\n", r, ns)
 	return nil
 }
 

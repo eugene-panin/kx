@@ -174,6 +174,23 @@ Clusters are addressed as <client>/<cluster>.`,
 		},
 	}
 
+	ns := &cobra.Command{
+		Use:   "ns [client/cluster] [namespace]",
+		Short: "Show or set the default namespace of a context",
+		Long: `Without arguments prints the namespace of the current context. With a
+namespace sets it on the current context; with a cluster and a namespace sets
+it on that cluster, even one that is off. The namespace is not looked up in
+the cluster, so this works offline.`,
+		Example: `  kx ns
+  kx ns monitoring
+  kx ns acme/prod monitoring`,
+		Args:              cobra.MaximumNArgs(2),
+		ValidArgsFunction: a.completeRefs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return a.Namespace(args)
+		},
+	}
+
 	use := &cobra.Command{
 		Use:   "use [client/cluster]",
 		Short: "Set current-context, or print it without arguments",
@@ -271,7 +288,7 @@ under 30 days. Errors are listed below the table; --json has full details.`,
 	}
 	build.Flags().BoolVar(&buildForce, "force", false, "drop contexts kx does not manage")
 
-	root.AddCommand(add, importCurrent, ls, use, on, off, rm, mv, export, execCmd, check, ui, build)
+	root.AddCommand(add, importCurrent, ls, use, ns, on, off, rm, mv, export, execCmd, check, ui, build)
 	return root
 }
 

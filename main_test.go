@@ -523,3 +523,61 @@ func TestCheckHealthNodesVersions(t *testing.T) {
 		t.Errorf("ls table lacks the version:\n%s", out)
 	}
 }
+
+func TestNamespace(t *testing.T) {
+	e := newEnv(t)
+	e.ok("add", e.Kubeconfig("a.yaml", "https://a"), "-c", "acme", "-n", "prod")
+	e.ok("add", e.Kubeconfig("b.yaml", "https://b"), "-c", "acme", "-n", "stage")
+	e.ok("off", "acme/stage")
+	nsOf := func(path, ctx string) string {
+		t.Helper()
+		cfg, err := clientcmd.LoadFromFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cfg.Contexts[ctx].Namespace
+	}
+	backups := func() int {
+		entries, _ := os.ReadDir(filepath.Join(e.Home, "backups"))
+		return len(entries)
+	}
+	before := backups()
+
+	for _, args := range [][]string{{"ns"}, {"ns", "monitoring"}} {
+		if _, err := e.run("", args...); err == nil {
+			t.Errorf("kx %v without a current context succeeded", args)
+		}
+	}
+
+	e.ok("use", "acme/prod")
+	if out := strings.TrimSpace(e.ok("ns")); out != "default" {
+		t.Errorf("ns with none set = %q, want default", out)
+	}
+	e.ok("ns", "monitoring")
+	if got := nsOf(e.Target, "acme/prod"); got != "monitoring" {
+		t.Errorf("target namespace = %q", got)
+	}
+	if got := nsOf(filepath.Join(e.Home, "clusters", "acme", "prod.yaml"), "acme/prod"); got != "monitoring" {
+		t.Errorf("stored namespace = %q", got)
+	}
+	if out := strings.TrimSpace(e.ok("ns")); out != "monitoring" {
+		t.Errorf("ns = %q", out)
+	}
+	if backups() != before {
+		t.Error("ns wrote a backup")
+	}
+
+	// A cluster that is off only lives in the store; it keeps the namespace
+	// and brings it back when turned on.
+	e.ok("ns", "acme/stage", "web")
+	e.ok("on", "acme/stage")
+	if got := nsOf(e.Target, "acme/stage"); got != "web" {
+		t.Errorf("namespace after turning on = %q", got)
+	}
+
+	for _, bad := range [][]string{{"ns", "Bad_NS"}, {"ns", "acme", "web"}, {"ns", "acme/nope", "web"}} {
+		if _, err := e.run("", bad...); err == nil {
+			t.Errorf("kx %v succeeded", bad)
+		}
+	}
+}

@@ -44,6 +44,7 @@ generated file.
 kx add <file|-> -c <client> [--name N] [--context C]... [--force]
 kx ls [client] [--json]
 kx use [client/cluster]
+kx ns [client/cluster] [namespace]
 kx on  <client|client/cluster>...
 kx off <client|client/cluster>...
 kx rm  <client|client/cluster>... [-y]
@@ -60,6 +61,7 @@ kx build [--force]
 | `add` | Splits the input kubeconfig into contexts, renames them to `client/<name>`, inlines files and puts them in the store. `--context` takes only the named ones. `--name` sets the cluster name (single context only). By default the name is the original context name, sanitized (for an EKS ARN, the part after the last `/`). `--force` overwrites an existing cluster. |
 | `ls` | Table of `CLIENT CLUSTER SERVER NAMESPACE VERSION STATE`, `*` marks the current context. VERSION comes from the last check. `--json` for scripts and agents, no credentials. |
 | `use` | Sets `current-context`, the cluster kubectl, helm and k9s talk to by default. Without an argument prints the current one. Only that one field is rewritten, with no rebuild and no backup, so switching back and forth doesn't push useful backups out. A cluster that is off can't be made current; turning off or removing the current cluster clears `current-context`. |
+| `ns` | Prints or sets the default namespace: of the current context, or of the named cluster (even one that is off). Written to the target and to the store, rewriting only that field, with no rebuild and no backup. The name is checked against Kubernetes rules (DNS-1123 label) but not looked up in the cluster, so it works offline. |
 | `on`/`off` | Turn on or off. `on acme/prod` while `acme` is off turns on prod only. |
 | `rm` | Remove. Removing more than one cluster asks first (`-y` skips the question). |
 | `mv` | `mv acme/old acme/new` renames a cluster, `mv unsorted/x acme` moves it to a client, `mv acme acme-corp` renames a client. |
@@ -119,7 +121,8 @@ The main use case is "someone sent a config, I drop it in, Lens picks it up":
   pasted in chat goes in with two key presses.
 - `a` reads a kubeconfig from a file. The file can be dragged from Finder into
   the terminal: quotes and escaped spaces in the path are handled.
-- `enter` makes a cluster current (`current-context`, marked `*`).
+- `enter` makes a cluster current (`current-context`, marked `*`), `n` sets
+  its default namespace.
 - `space` turns a cluster or a whole client on or off, `r` renames, `d`
   deletes (asks first), `i` imports foreign contexts from `~/.kube/config`.
 - Clusters are shown as a client/cluster tree; `/` filters by name and server.
@@ -188,7 +191,6 @@ as is), bubbletea and lipgloss for the interactive mode and colors.
 
 ## Not done yet
 
-- `kx ns` to switch namespaces (k9s and kubens do it for now).
 - A separate current context per shell (`kx exec <client> -- $SHELL` covers
   part of it).
 - Importing straight from clouds (`kx sync aws|yc|do`).
