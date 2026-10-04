@@ -12,12 +12,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/bubbles/cursor"
-	"github.com/charmbracelet/bubbles/help"
-	"github.com/charmbracelet/bubbles/key"
-	"github.com/charmbracelet/bubbles/spinner"
-	"github.com/charmbracelet/bubbles/textinput"
-	tea "github.com/charmbracelet/bubbletea"
+	"charm.land/bubbles/v2/help"
+	"charm.land/bubbles/v2/key"
+	"charm.land/bubbles/v2/spinner"
+	"charm.land/bubbles/v2/textinput"
+	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/colorprofile"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/eugene-panin/kx/internal/app"
 	"github.com/eugene-panin/kx/internal/probe"
@@ -46,7 +46,7 @@ var keys = keyMap{
 	PageDown:  key.NewBinding(key.WithKeys("pgdown", "ctrl+f")),
 	Use:       key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "use")),
 	Namespace: key.NewBinding(key.WithKeys("n"), key.WithHelp("n", "namespace")),
-	Toggle:    key.NewBinding(key.WithKeys(" "), key.WithHelp("space", "on/off")),
+	Toggle:    key.NewBinding(key.WithKeys("space"), key.WithHelp("space", "on/off")),
 	Check:     key.NewBinding(key.WithKeys("c"), key.WithHelp("c", "check")),
 	Paste:     key.NewBinding(key.WithKeys("p"), key.WithHelp("p", "paste")),
 	Add:       key.NewBinding(key.WithKeys("a"), key.WithHelp("a", "add")),
@@ -148,12 +148,14 @@ type model struct {
 func newModel(a *app.App) model {
 	in := textinput.New()
 	in.CharLimit = 4096
-	in.Cursor.SetMode(cursor.CursorStatic)
+	st := in.Styles()
+	st.Cursor.Blink = false
+	in.SetStyles(st)
 	sp := spinner.New()
 	sp.Spinner = spinner.MiniDot
 	return model{
 		a:          a,
-		o:          table.New(a.Stdout),
+		o:          a.Output(a.Stdout),
 		input:      in,
 		checks:     map[string]probe.Result{},
 		checking:   map[string]bool{},
@@ -179,7 +181,14 @@ func Run(a *app.App) error {
 			null.Close()
 		}()
 	}
-	p := tea.NewProgram(newModel(a), tea.WithAltScreen(), tea.WithInput(a.Stdin), tea.WithOutput(a.Stdout))
+	m := newModel(a)
+	opts := []tea.ProgramOption{tea.WithInput(a.Stdin), tea.WithOutput(a.Stdout)}
+	if !m.o.Color {
+		// The help bar and the input bring their own colors; keep only
+		// bold and reverse so the cursor stays visible.
+		opts = append(opts, tea.WithColorProfile(colorprofile.Ascii))
+	}
+	p := tea.NewProgram(m, opts...)
 	_, err := p.Run()
 	return err
 }
@@ -291,7 +300,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
-		m.help.Width = msg.Width
+		m.help.SetWidth(msg.Width)
 		m.clamp()
 	case loadedMsg:
 		if msg.err != nil {
@@ -344,7 +353,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.spin, cmd = m.spin.Update(msg)
 			return m, cmd
 		}
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
 		if m.mode != modeNormal {
 			return m.updateInput(msg)
 		}
@@ -353,7 +362,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m model) updateNormal(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	m.status, m.failed, m.notice = "", false, false
 	switch {
 	case key.Matches(msg, keys.Quit):
@@ -445,7 +454,7 @@ func (m model) prompt(md mode, prompt, value string) (tea.Model, tea.Cmd) {
 	return m, m.input.Focus()
 }
 
-func (m model) updateInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m model) updateInput(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if m.mode == modeConfirm {
 		m.mode = modeNormal
 		if it, ok := m.current(); ok && msg.String() == "y" {
@@ -455,8 +464,8 @@ func (m model) updateInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	switch msg.Type {
-	case tea.KeyEsc:
+	switch msg.String() {
+	case "esc":
 		if m.mode == modeFilter {
 			m.filter = ""
 			m.rebuild(m.selected())
@@ -464,7 +473,7 @@ func (m model) updateInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.mode = modeNormal
 		m.input.Blur()
 		return m, nil
-	case tea.KeyEnter:
+	case "enter":
 		md, val := m.mode, strings.TrimSpace(m.input.Value())
 		m.mode = modeNormal
 		m.input.Blur()
@@ -654,7 +663,13 @@ func (m *model) clamp() {
 	m.offset = max(0, min(m.offset, len(m.items)-h))
 }
 
-func (m model) View() string {
+func (m model) View() tea.View {
+	v := tea.NewView(m.screen())
+	v.AltScreen = true
+	return v
+}
+
+func (m model) screen() string {
 	if m.width == 0 {
 		return ""
 	}

@@ -231,7 +231,9 @@ live next to their packages.
 
 Go, `cobra`, `k8s.io/client-go/tools/clientcmd` (loading, resolving relative
 paths, flattening, writing; exec plugins and other fields are carried over
-as is), bubbletea and lipgloss for the interactive mode and colors.
+as is), bubbletea, bubbles and lipgloss v2 for the interactive mode and
+colors. v2 matters: v1 queried the terminal in `init()`, which delayed every
+command, not just the interactive one.
 
 ## Global flags
 

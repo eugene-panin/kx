@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/charmbracelet/bubbles/spinner"
-	tea "github.com/charmbracelet/bubbletea"
+	"charm.land/bubbles/v2/spinner"
+	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/eugene-panin/kx/internal/app"
 	"github.com/eugene-panin/kx/internal/kxtest"
@@ -49,18 +49,19 @@ func drive(t *testing.T, m tea.Model, msgs ...tea.Msg) tea.Model {
 	return m
 }
 
-func keyMsg(s string) tea.KeyMsg {
+func keyMsg(s string) tea.KeyPressMsg {
 	switch s {
 	case "enter":
-		return tea.KeyMsg{Type: tea.KeyEnter}
+		return tea.KeyPressMsg{Code: tea.KeyEnter}
 	case "esc":
-		return tea.KeyMsg{Type: tea.KeyEsc}
+		return tea.KeyPressMsg{Code: tea.KeyEscape}
 	case "space":
-		return tea.KeyMsg{Type: tea.KeySpace, Runes: []rune{' '}}
+		return tea.KeyPressMsg{Code: tea.KeySpace, Text: " "}
 	case "ctrl+u":
-		return tea.KeyMsg{Type: tea.KeyCtrlU}
+		return tea.KeyPressMsg{Code: 'u', Mod: tea.ModCtrl}
 	}
-	return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s)}
+	r := []rune(s)[0]
+	return tea.KeyPressMsg{Code: r, Text: s}
 }
 
 func typed(s string) []tea.Msg {
@@ -146,7 +147,7 @@ func TestTUINavigateAndToggle(t *testing.T) {
 		t.Fatalf("cursor on %q, want globex", got)
 	}
 	e.WantContexts("acme/stage")
-	if v := ansi.Strip(m.View()); !strings.Contains(v, "globex off") || !strings.Contains(v, "off") {
+	if v := ansi.Strip(m.View().Content); !strings.Contains(v, "globex off") || !strings.Contains(v, "off") {
 		t.Errorf("view does not show disabled state:\n%s", v)
 	}
 }
@@ -165,7 +166,7 @@ func TestTUIUse(t *testing.T) {
 	if cfg, _ := clientcmd.LoadFromFile(e.Target); cfg.CurrentContext != "acme/stage" {
 		t.Errorf("current-context = %q", cfg.CurrentContext)
 	}
-	if v := ansi.Strip(m.View()); !strings.Contains(v, "*  stage") {
+	if v := ansi.Strip(m.View().Content); !strings.Contains(v, "*  stage") {
 		t.Errorf("view does not mark the current cluster:\n%s", v)
 	}
 }
@@ -180,7 +181,7 @@ func TestTUINamespace(t *testing.T) {
 		t.Errorf("n on a client: status = %q", st)
 	}
 	m = drive(t, m, keyMsg("j"), keyMsg("n"))
-	if v := m.View(); !strings.Contains(v, "namespace for acme/prod: default") {
+	if v := ansi.Strip(m.View().Content); !strings.Contains(v, "namespace for acme/prod: default") {
 		t.Fatalf("no namespace prompt:\n%s", v)
 	}
 	msgs := append([]tea.Msg{keyMsg("ctrl+u")}, typed("monitoring")...)
@@ -192,7 +193,7 @@ func TestTUINamespace(t *testing.T) {
 	if ns := cfg.Contexts["acme/prod"].Namespace; ns != "monitoring" {
 		t.Errorf("namespace = %q", ns)
 	}
-	if v := ansi.Strip(m.View()); !strings.Contains(v, "monitoring") {
+	if v := ansi.Strip(m.View().Content); !strings.Contains(v, "monitoring") {
 		t.Errorf("view does not show the new namespace:\n%s", v)
 	}
 }
@@ -234,7 +235,7 @@ func TestTUIAdd(t *testing.T) {
 	e := newEnv(t)
 	path := e.Kubeconfig("a.yaml", "https://a")
 	m := newTUI(t, e, 100, 20)
-	if v := m.View(); !strings.Contains(v, "press a to add") {
+	if v := ansi.Strip(m.View().Content); !strings.Contains(v, "press a to add") {
 		t.Errorf("empty view has no hint:\n%s", v)
 	}
 	msgs := append([]tea.Msg{keyMsg("a")}, typed(path)...)
@@ -266,7 +267,7 @@ func TestTUIPaste(t *testing.T) {
 
 	clip = []byte(strings.Replace(strings.Replace(kxtest.Kubeadm, "%s", "https://new", 1), "certificate-authority: ca.crt", "insecure-skip-tls-verify: true", 1))
 	tm = drive(t, tm, keyMsg("p"))
-	if v := tm.View(); !strings.Contains(v, "client for 1 contexts from clipboard: acme") {
+	if v := ansi.Strip(tm.View().Content); !strings.Contains(v, "client for 1 contexts from clipboard: acme") {
 		t.Fatalf("no client prompt prefilled with the selected client:\n%s", v)
 	}
 	msgs := append([]tea.Msg{keyMsg("ctrl+u")}, typed("globex")...)
@@ -332,7 +333,7 @@ func TestTUICheck(t *testing.T) {
 	if !ok || res.Status != "ok" {
 		t.Fatalf("check result = %+v", res)
 	}
-	if v := ansi.Strip(m.View()); !strings.Contains(v, "kubernetes-admin") || !strings.Contains(v, "v1.31.2") {
+	if v := ansi.Strip(m.View().Content); !strings.Contains(v, "kubernetes-admin") || !strings.Contains(v, "v1.31.2") {
 		t.Errorf("detail line misses the check result:\n%s", v)
 	}
 }
@@ -348,7 +349,7 @@ func TestTUIRemembersChecks(t *testing.T) {
 	// A new session shows the last result without probing anything.
 	m := newTUI(t, e, 140, 20)
 	m = drive(t, m, keyMsg("j"))
-	v := ansi.Strip(m.View())
+	v := ansi.Strip(m.View().Content)
 	for _, want := range []string{"v1.36.2", "ok", "nodes 1/1", "checked just now"} {
 		if !strings.Contains(v, want) {
 			t.Errorf("view lacks %q:\n%s", want, v)
@@ -410,12 +411,12 @@ func TestTUIForeignContexts(t *testing.T) {
 		t.Fatal(err)
 	}
 	m := newTUI(t, e, 120, 20)
-	if v := m.View(); !strings.Contains(v, "unmanaged contexts") {
+	if v := ansi.Strip(m.View().Content); !strings.Contains(v, "unmanaged contexts") {
 		t.Errorf("no banner about foreign contexts:\n%s", v)
 	}
 	m = drive(t, m, keyMsg("i"))
 	e.WantContexts("unsorted/kubernetes-admin-kubernetes")
-	if v := m.View(); strings.Contains(v, "unmanaged contexts") {
+	if v := ansi.Strip(m.View().Content); strings.Contains(v, "unmanaged contexts") {
 		t.Errorf("banner still shown after import:\n%s", v)
 	}
 }
@@ -426,7 +427,7 @@ func TestTUIFitsAnyWidth(t *testing.T) {
 	for _, w := range []int{30, 50, 80, 140} {
 		for _, h := range []int{3, 8, 30} {
 			m := newTUI(t, e, w, h)
-			v := m.View()
+			v := ansi.Strip(m.View().Content)
 			lines := strings.Split(v, "\n")
 			if len(lines) > max(h, fixedLines+1) {
 				t.Errorf("%dx%d: %d lines", w, h, len(lines))

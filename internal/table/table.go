@@ -5,10 +5,9 @@ import (
 	"os"
 	"strings"
 
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/charmbracelet/x/term"
-	"github.com/muesli/termenv"
 )
 
 const colGap = 2
@@ -34,21 +33,19 @@ func New(w io.Writer) *Output {
 		}
 		o.Color = os.Getenv("NO_COLOR") == "" && os.Getenv("KX_NO_COLOR") == "" && os.Getenv("TERM") != "dumb"
 	}
-	r := lipgloss.NewRenderer(w)
 	if os.Getenv("FORCE_COLOR") != "" && os.Getenv("NO_COLOR") == "" && os.Getenv("KX_NO_COLOR") == "" {
 		o.Color = true
-		r.SetColorProfile(termenv.ANSI)
 	}
 	// Basic ANSI colors follow the user's terminal theme.
-	o.Plain = r.NewStyle()
-	o.OK = r.NewStyle().Foreground(lipgloss.Color("2"))
-	o.Bad = r.NewStyle().Foreground(lipgloss.Color("1"))
-	o.Warn = r.NewStyle().Foreground(lipgloss.Color("3"))
-	o.Dim = r.NewStyle().Faint(true)
-	o.Bold = r.NewStyle().Bold(true)
-	o.Title = r.NewStyle().Bold(true).Foreground(lipgloss.Color("4"))
-	o.Header = r.NewStyle().Faint(true)
-	o.Sel = r.NewStyle().Reverse(true)
+	o.Plain = lipgloss.NewStyle()
+	o.OK = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))
+	o.Bad = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
+	o.Warn = lipgloss.NewStyle().Foreground(lipgloss.Color("3"))
+	o.Dim = lipgloss.NewStyle().Faint(true)
+	o.Bold = lipgloss.NewStyle().Bold(true)
+	o.Title = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("4"))
+	o.Header = lipgloss.NewStyle().Faint(true)
+	o.Sel = lipgloss.NewStyle().Reverse(true)
 	return o
 }
 
