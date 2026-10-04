@@ -1,0 +1,56 @@
+version: 2
+project_name: kx
+
+before:
+  hooks:
+    - sh -c 'mkdir -p completions && for s in bash zsh fish; do go run . completion "$s" > "completions/kx.$s"; done'
+
+builds:
+  - main: .
+    binary: kx
+    env:
+      - CGO_ENABLED=0
+    goos: [darwin, linux]
+    goarch: [amd64, arm64]
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version=v{{ .Version }}
+
+archives:
+  - formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENSE
+      - README.md
+      - completions/*
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  use: git
+  sort: asc
+
+homebrew_casks:
+  - name: kx
+    repository:
+      owner: eugene-panin
+      name: homebrew-tap
+    directory: Casks
+    homepage: https://github.com/eugene-panin/kx
+    description: Keep kubeconfigs for many clients' clusters in one place
+    license: MIT
+    completions:
+      bash: completions/kx.bash
+      zsh: completions/kx.zsh
+      fish: completions/kx.fish
+    caveats: |
+      kx builds ~/.kube/config from the clusters it manages.
+      If that file already has clusters in it, start with: kx import-current
+    hooks:
+      post:
+        install: |
+          if OS.mac?
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/kx"]
+          end

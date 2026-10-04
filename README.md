@@ -12,16 +12,25 @@ k9s, kubectl and helm don't know kx exists. They just read the usual config.
 
 ## Install
 
-You need Go 1.26 or newer.
+With Homebrew (macOS and Linux):
+
+```bash
+brew install eugene-panin/tap/kx
+```
+
+This also sets up shell completion for cluster names.
+
+With Go 1.26 or newer:
 
 ```bash
 go install github.com/eugene-panin/kx@latest
 ```
 
-Or from a checkout: `go install .` in the repo root. The binary ends up in `$(go env GOPATH)/bin`, usually `~/go/bin`. Add it to
-your `PATH` if it isn't there yet.
+Or from a checkout: `go install .` in the repo root. The binary ends up in
+`$(go env GOPATH)/bin`, usually `~/go/bin`. Add it to your `PATH` if it isn't
+there yet.
 
-Shell completion for cluster names (zsh):
+Shell completion when installed with Go (zsh):
 
 ```bash
 kx completion zsh > "${fpath[1]}/_kx"
