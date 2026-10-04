@@ -93,7 +93,7 @@ func (a *App) Add(src, client, name string, contexts []string, force bool) ([]st
 			return added, err
 		}
 		added = append(added, it.r)
-		fmt.Fprintf(a.Stdout, "added %s  %s\n", it.r, it.cfg.Clusters[it.r.String()].Server)
+		a.say("added %s  %s", it.r, it.cfg.Clusters[it.r.String()].Server)
 	}
 	return added, a.Build(false, nil)
 }
@@ -133,7 +133,7 @@ func (a *App) ImportCurrent(client string) error {
 			return err
 		}
 		renames[ctx] = r.String()
-		fmt.Fprintf(a.Stdout, "imported %s as %s\n", ctx, r)
+		a.say("imported %s as %s", ctx, r)
 	}
 	// The originals now live in the store under new names; let the build drop them.
 	st, err := a.Store.LoadState()
@@ -230,7 +230,7 @@ func (a *App) List(client string, asJSON bool) error {
 		return nil
 	}
 
-	o := table.New(a.Stdout)
+	o := a.Output(a.Stdout)
 	if !o.TTY {
 		// One line per cluster with the client on it, so grep keeps working.
 		cols := []table.Column{{}, {Title: "CLIENT"}, {Title: "CLUSTER"}, {Title: "SERVER"}, {Title: "NAMESPACE"}, {Title: "VERSION"}, {Title: "STATE"}}
@@ -329,18 +329,26 @@ func (a *App) Toggle(args []string, on bool) error {
 		return err
 	}
 	for _, r := range refs {
-		fmt.Fprintf(a.Stdout, "%s: %s\n", r, word)
+		a.say("%s: %s", r, word)
 	}
 	return nil
 }
 
-func (a *App) Remove(args []string, yes bool) error {
+// Remove deletes clusters from the store. dryRun lists them and changes
+// nothing; otherwise it asks first unless yes.
+func (a *App) Remove(args []string, yes, dryRun bool) error {
 	if err := a.prepare(); err != nil {
 		return err
 	}
 	refs, err := a.Store.Expand(args)
 	if err != nil {
 		return err
+	}
+	if dryRun {
+		for _, r := range refs {
+			fmt.Fprintf(a.Stdout, "would remove %s\n", r)
+		}
+		return nil
 	}
 	// The store holds the only copy of a cluster's credentials once it's off,
 	// so every removal is confirmed, one cluster or many.
@@ -361,7 +369,7 @@ func (a *App) Remove(args []string, yes bool) error {
 		if err := a.Store.Remove(r); err != nil {
 			return err
 		}
-		fmt.Fprintf(a.Stdout, "removed %s\n", r)
+		a.say("removed %s", r)
 	}
 	if err := a.pruneState(); err != nil {
 		return err
@@ -426,7 +434,7 @@ func (a *App) Move(fromArg, toArg string) error {
 		} else if !st.Enabled(m.to) {
 			turnedOff = append(turnedOff, m.to)
 		}
-		fmt.Fprintf(a.Stdout, "moved %s -> %s\n", m.from, m.to)
+		a.say("moved %s -> %s", m.from, m.to)
 	}
 	if err := a.Store.SaveState(st); err != nil {
 		return err
@@ -438,7 +446,7 @@ func (a *App) Move(fromArg, toArg string) error {
 		return err
 	}
 	for _, r := range turnedOff {
-		fmt.Fprintf(a.Stdout, "%s is off now: client %s is off (kx on %s turns it back on)\n", r, r.Client, r)
+		a.say("%s is off now: client %s is off (kx on %s turns it back on)", r, r.Client, r)
 	}
 	return nil
 }
@@ -515,7 +523,7 @@ func (a *App) Use(arg string) error {
 			return err
 		}
 	}
-	fmt.Fprintf(a.Stdout, "using %s\n", r)
+	a.say("using %s", r)
 	return nil
 }
 
@@ -580,7 +588,7 @@ func (a *App) Namespace(args []string) error {
 			return err
 		}
 	}
-	fmt.Fprintf(a.Stdout, "%s: namespace %s\n", r, ns)
+	a.say("%s: namespace %s", r, ns)
 	return nil
 }
 
@@ -600,7 +608,10 @@ func (a *App) pruneState() error {
 // confirm asks on the terminal and returns nil on yes. Without a terminal it
 // doesn't ask at all: a question nobody can answer only hangs scripts.
 func (a *App) confirm(question, flag string) error {
-	if !table.IsTerminal(a.Stdin) {
+	switch {
+	case a.NoInput:
+		return &UsageError{Err: errors.New("needs confirmation and --no-input is set"), Hint: "pass " + flag + " to go ahead without asking"}
+	case !table.IsTerminal(a.Stdin):
 		return &UsageError{Err: errors.New("needs confirmation and stdin is not a terminal"), Hint: "pass " + flag + " to go ahead without asking"}
 	}
 	fmt.Fprintf(a.Stderr, "%s [y/N] ", question)

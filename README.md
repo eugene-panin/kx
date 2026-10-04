@@ -38,6 +38,12 @@ kx completion zsh > "${fpath[1]}/_kx"
 
 bash and fish work the same way, see `kx completion --help`.
 
+To uninstall: `brew uninstall kx` (or delete the binary from `~/go/bin`). kx
+leaves `~/.kube/config` as it last built it. Your clusters stay in
+`~/.config/kx`, backups in `~/.local/state/kx` and check results in
+`~/.cache/kx`; delete those directories too if you want them gone. Before that,
+`kx export <client>` gives you any cluster as a plain kubeconfig.
+
 ## First run
 
 If `~/.kube/config` already has clusters in it, hand them over to kx first:
@@ -146,8 +152,9 @@ A project is over (removal always asks; without a terminal kx won't ask and
 wants `-y` instead):
 
 ```bash
-kx rm globex        # asks first
-kx rm acme/stage -y # no question, for scripts
+kx rm globex             # asks first
+kx rm acme/stage --dry-run
+kx rm acme/stage -y      # no question, for scripts
 ```
 
 Pick the cluster kubectl and helm use by default:
@@ -255,9 +262,16 @@ misbehave: it can still read `~/.kube/config` directly.
 
 | variable | default | |
 |---|---|---|
-| `KX_HOME` | `$XDG_CONFIG_HOME/kx` or `~/.config/kx` | where clusters, state and backups live |
+| `KX_HOME` | unset | keep clusters, backups and check results all in this one directory |
+| `XDG_CONFIG_HOME` | `~/.config` | clusters and state go to `$XDG_CONFIG_HOME/kx` |
+| `XDG_STATE_HOME` | `~/.local/state` | backups go to `$XDG_STATE_HOME/kx/backups` |
+| `XDG_CACHE_HOME` | `~/.cache` | check results go to `$XDG_CACHE_HOME/kx` |
 | `KX_KUBECONFIG` | `~/.kube/config` | the file kx builds |
-| `NO_COLOR` | | turn colors off |
+| `NO_COLOR`, `KX_NO_COLOR` | | turn colors off (same as `--no-color`) |
+| `FORCE_COLOR` | | colors even when the output isn't a terminal |
+
+Global flags: `--no-color`, `--no-input` (never ask, fail instead), `-q` /
+`--quiet` (results only, no status lines).
 
 ## Exit codes
 
@@ -275,9 +289,13 @@ misbehave: it can still read `~/.kube/config` directly.
 ~/.config/kx/
   clusters/acme/prod.yaml   one file per cluster, each one works on its own
   state.yaml                what is turned off
-  checks.json               last check results
-  backups/                  previous versions of ~/.kube/config
+~/.local/state/kx/backups/  previous versions of ~/.kube/config (last ten)
+~/.cache/kx/checks.json     last check results
 ```
+
+kx 0.5 and older kept backups and check results in `~/.config/kx`; newer
+versions move them on first run and say so. Backups contain credentials, and
+`~/.config` is often synced as dotfiles.
 
 Any file under `clusters/` can be used directly:
 `KUBECONFIG=~/.config/kx/clusters/acme/prod.yaml kubectl get pods`.

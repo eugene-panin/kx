@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/eugene-panin/kx/internal/app"
 	"github.com/eugene-panin/kx/internal/kxtest"
@@ -812,5 +813,115 @@ func TestUsageErrors(t *testing.T) {
 	out, err := e.run("", "add", "--bogus", "-h")
 	if err != nil || !strings.Contains(out, "Usage:") {
 		t.Errorf("-h after a bad flag: err = %v\n%s", err, out)
+	}
+}
+
+func TestDryRuns(t *testing.T) {
+	e := newEnv(t)
+	e.ok("add", e.Kubeconfig("a.yaml", "https://a"), "-c", "acme", "--name", "prod")
+	if out := e.ok("rm", "acme", "--dry-run"); !strings.Contains(out, "would remove acme/prod") {
+		t.Errorf("rm --dry-run:\n%s", out)
+	}
+	editTarget(t, e, func(cfg *api.Config) { cfg.Contexts["eks"] = cfg.Contexts["acme/prod"].DeepCopy() })
+	out := e.ok("build", "--force", "--dry-run")
+	if !strings.Contains(out, "would drop eks") || !strings.Contains(out, "would write") {
+		t.Errorf("build --force --dry-run:\n%s", out)
+	}
+	e.WantContexts("acme/prod", "eks")
+}
+
+func TestQuietAndNoInput(t *testing.T) {
+	e := newEnv(t)
+	if out := e.ok("add", e.Kubeconfig("a.yaml", "https://a"), "-c", "acme", "--name", "prod", "-q"); strings.TrimSpace(out) != "" {
+		t.Errorf("add -q printed %q", out)
+	}
+	_, err := e.run("", "rm", "acme", "--no-input")
+	var usage *app.UsageError
+	if !errors.As(err, &usage) || !strings.Contains(err.Error(), "--no-input") {
+		t.Errorf("rm --no-input: %v", err)
+	}
+}
+
+func TestNotAKubeconfig(t *testing.T) {
+	e := newEnv(t)
+	_, err := e.run("just some text\n", "add", "-", "-c", "acme")
+	if err == nil || !strings.Contains(err.Error(), "stdin is not a kubeconfig") || strings.Contains(err.Error(), "struct") {
+		t.Errorf("garbage on stdin: %v", err)
+	}
+}
+
+func TestPipedTableHasNoEmptyCells(t *testing.T) {
+	e := newEnv(t)
+	e.ok("add", e.Kubeconfig("a.yaml", "https://a"), "-c", "acme", "--name", "prod")
+	for _, l := range strings.Split(strings.TrimSpace(e.ok("ls")), "\n")[1:] {
+		// CLIENT CLUSTER SERVER NAMESPACE VERSION STATE, mark column aside
+		if f := strings.Fields(l); len(f) != 6 {
+			t.Errorf("row has %d fields, empty cells must be '-': %q", len(f), l)
+		}
+	}
+}
+
+func TestDeprecatedShorthands(t *testing.T) {
+	e := newEnv(t)
+	out := e.ok("add", e.Kubeconfig("a.yaml", "https://a"), "-c", "acme", "-n", "prod")
+	if !strings.Contains(out, "use --name") {
+		t.Errorf("add -n gives no deprecation warning:\n%s", out)
+	}
+	e.WantContexts("acme/prod")
+	if out := e.ok("-v"); !strings.Contains(out, "use --version") {
+		t.Errorf("-v gives no deprecation warning:\n%s", out)
+	}
+}
+
+func TestOldFilesMoveToXDG(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("KX_HOME", "")
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("XDG_STATE_HOME", "")
+	t.Setenv("XDG_CACHE_HOME", "")
+	t.Setenv("KX_KUBECONFIG", filepath.Join(home, "kubeconfig"))
+	old := filepath.Join(home, ".config", "kx")
+	if err := os.MkdirAll(filepath.Join(old, "backups"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(old, "backups", "config-1"), []byte("x"), 0o600)
+	os.WriteFile(filepath.Join(old, "checks.json"), []byte("{}"), 0o600)
+
+	var out, errOut bytes.Buffer
+	if err := run([]string{"ls"}, strings.NewReader(""), &out, &errOut); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{".local/state/kx/backups/config-1", ".cache/kx/checks.json"} {
+		if _, err := os.Stat(filepath.Join(home, p)); err != nil {
+			t.Errorf("%s not moved: %v", p, err)
+		}
+	}
+	if !strings.Contains(errOut.String(), "moved backups") {
+		t.Errorf("move not reported: %q", errOut.String())
+	}
+
+	// An older kx writing to the old place again gets merged in, not stranded.
+	os.MkdirAll(filepath.Join(old, "backups"), 0o700)
+	os.WriteFile(filepath.Join(old, "backups", "config-2"), []byte("y"), 0o600)
+	if err := run([]string{"ls"}, strings.NewReader(""), &out, &errOut); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".local/state/kx/backups/config-2")); err != nil {
+		t.Errorf("second backup not merged: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(old, "backups")); !os.IsNotExist(err) {
+		t.Error("old backups dir left behind")
+	}
+
+	// --help changes nothing on disk.
+	os.WriteFile(filepath.Join(old, "checks.json"), []byte("{}"), 0o600)
+	future := time.Now().Add(time.Hour)
+	os.Chtimes(filepath.Join(old, "checks.json"), future, future)
+	if err := run([]string{"--help"}, strings.NewReader(""), &out, &errOut); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(old, "checks.json")); err != nil {
+		t.Error("--help moved files")
 	}
 }

@@ -24,6 +24,11 @@ func (a *App) Check(ctx context.Context, args []string, all bool, timeout time.D
 	if err != nil {
 		return err
 	}
+	if ctx.Err() != nil {
+		// Ctrl-C: half the answers are timeouts that never happened.
+		fmt.Fprintln(a.Stderr, "kx: interrupted")
+		return ExitError(130)
+	}
 	if asJSON {
 		enc := json.NewEncoder(a.Stdout)
 		enc.SetIndent("", "  ")
@@ -47,6 +52,11 @@ func (a *App) CheckAdded(ctx context.Context, refs []store.Ref, timeout time.Dur
 	if err != nil {
 		return err
 	}
+	if ctx.Err() != nil {
+		// Ctrl-C: half the answers are timeouts that never happened.
+		fmt.Fprintln(a.Stderr, "kx: interrupted")
+		return ExitError(130)
+	}
 	failed := false
 	for _, r := range results {
 		parts := []string{"check " + r.Context, r.Status}
@@ -69,6 +79,12 @@ func (a *App) CheckAdded(ctx context.Context, refs []store.Ref, timeout time.Dur
 
 // probeAll checks refs in parallel and remembers the results.
 func (a *App) probeAll(ctx context.Context, refs []store.Ref, timeout time.Duration) ([]probe.Result, error) {
+	// Waiting on clusters can take the whole timeout; on a terminal, say so
+	// right away and clear the line once the answers are in.
+	if table.IsTerminal(a.Stderr) && !a.Quiet && len(refs) > 0 {
+		fmt.Fprintf(a.Stderr, "checking %s…", plural(len(refs), "cluster"))
+		defer fmt.Fprint(a.Stderr, "\r\x1b[K")
+	}
 	results := make([]probe.Result, len(refs))
 	sem := make(chan struct{}, probe.Parallel)
 	var wg sync.WaitGroup
@@ -125,7 +141,7 @@ func (a *App) printCheck(results []probe.Result) error {
 		return err
 	}
 	policy := probe.NewVersionPolicy(known)
-	o := table.New(a.Stdout)
+	o := a.Output(a.Stdout)
 	now := time.Now()
 	cols := []table.Column{
 		{Title: "CLUSTER", Shrink: 12},
@@ -212,7 +228,7 @@ func NodesCell(o *table.Output, n *probe.NodeCount) table.Cell {
 	return table.Cell{Text: n.String(), Style: o.Plain}
 }
 
-func (a *App) checksPath() string { return filepath.Join(a.Store.Dir(), "checks.json") }
+func (a *App) checksPath() string { return filepath.Join(a.cacheDir, "checks.json") }
 
 // LoadChecks returns the last known result per context.
 func (a *App) LoadChecks() (map[string]probe.Result, error) {

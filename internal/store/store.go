@@ -44,8 +44,6 @@ func (s *Store) clustersDir() string { return filepath.Join(s.dir, "clusters") }
 
 func (s *Store) statePath() string { return filepath.Join(s.dir, "state.yaml") }
 
-func (s *Store) BackupsDir() string { return filepath.Join(s.dir, "backups") }
-
 func (s *Store) path(r Ref) string {
 	return filepath.Join(s.clustersDir(), r.Client, r.Cluster+".yaml")
 }

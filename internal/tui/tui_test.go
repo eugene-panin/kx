@@ -96,7 +96,7 @@ func (e *env) ok(args ...string) {
 	case "add":
 		_, err = a.Add(args[1], flag("-c"), flag("-n"), nil, false)
 	case "rm":
-		err = a.Remove(args[1:2], true)
+		err = a.Remove(args[1:2], true, false)
 	case "check":
 		err = a.Check(context.Background(), nil, false, 5*time.Second, false)
 	default:

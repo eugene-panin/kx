@@ -450,7 +450,7 @@ func (m model) updateInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.mode = modeNormal
 		if it, ok := m.current(); ok && msg.String() == "y" {
 			ref := it.ref()
-			return m.mutate(func(q *app.App) error { return q.Remove([]string{ref}, true) })
+			return m.mutate(func(q *app.App) error { return q.Remove([]string{ref}, true, false) })
 		}
 		return m, nil
 	}
@@ -674,7 +674,7 @@ func (m model) View() string {
 			clients++
 		}
 	}
-	title := o.Paint(o.Title, "kx") + o.Paint(o.Dim, fmt.Sprintf("  %d clusters · %d clients", len(m.rows), clients))
+	title := o.Paint(o.Title, "kx") + o.Paint(o.Dim, fmt.Sprintf("  %s · %s", countOf(len(m.rows), "cluster"), countOf(clients, "client")))
 	if m.filter != "" && m.mode != modeFilter {
 		title += o.Paint(o.Warn, "  /"+m.filter)
 	}
@@ -853,4 +853,11 @@ func expandHome(p string) string {
 		}
 	}
 	return p
+}
+
+func countOf(n int, noun string) string {
+	if n == 1 {
+		return "1 " + noun
+	}
+	return fmt.Sprintf("%d %ss", n, noun)
 }

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/eugene-panin/kx/internal/store"
+	"github.com/eugene-panin/kx/internal/table"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/clientcmd/api"
 )
@@ -23,13 +24,20 @@ func New(stdin io.Reader, stdout, stderr io.Writer) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
-	dir := os.Getenv("KX_HOME")
-	if dir == "" {
-		base := os.Getenv("XDG_CONFIG_HOME")
-		if base == "" {
-			base = filepath.Join(home, ".config")
+	xdg := func(env, def string) string {
+		if d := os.Getenv(env); filepath.IsAbs(d) {
+			return filepath.Join(d, "kx")
 		}
-		dir = filepath.Join(base, "kx")
+		return filepath.Join(home, def, "kx")
+	}
+	// KX_HOME keeps everything in one place; otherwise clusters are config,
+	// backups are state and check results are cache, each in its XDG home.
+	dir := os.Getenv("KX_HOME")
+	stateDir, cacheDir := dir, dir
+	if dir == "" {
+		dir = xdg("XDG_CONFIG_HOME", ".config")
+		stateDir = xdg("XDG_STATE_HOME", filepath.Join(".local", "state"))
+		cacheDir = xdg("XDG_CACHE_HOME", ".cache")
 	}
 	target := os.Getenv("KX_KUBECONFIG")
 	if target == "" {
@@ -42,7 +50,64 @@ func New(stdin io.Reader, stdout, stderr io.Writer) (*App, error) {
 	if resolved, err := filepath.EvalSymlinks(target); err == nil {
 		target = resolved
 	}
-	return &App{Store: store.New(dir), Target: target, Stdin: stdin, Stdout: stdout, Stderr: stderr}, nil
+	return &App{Store: store.New(dir), Target: target, Stdin: stdin, Stdout: stdout, Stderr: stderr, stateDir: stateDir, cacheDir: cacheDir}, nil
+}
+
+// MoveOldFiles moves what kx before 0.6 kept next to the clusters to its XDG
+// homes. Backups hold credentials and ~/.config is often synced as dotfiles,
+// so they shouldn't stay there. It merges rather than skips, because an older
+// kx may still write to the old place after the first move.
+func (a *App) MoveOldFiles() {
+	dir := a.Store.Dir()
+	moved := false
+	if old := filepath.Join(dir, "backups"); old != a.backupsDir() {
+		entries, _ := os.ReadDir(old)
+		for _, e := range entries {
+			to := filepath.Join(a.backupsDir(), e.Name())
+			if _, err := os.Stat(to); err == nil {
+				continue
+			}
+			if os.MkdirAll(a.backupsDir(), 0o700) == nil && os.Rename(filepath.Join(old, e.Name()), to) == nil {
+				moved = true
+			}
+		}
+		os.Remove(old) // only succeeds once it's empty
+		if moved {
+			fmt.Fprintf(a.Stderr, "kx: moved backups to %s\n", tilde(a.backupsDir()))
+		}
+	}
+	if old := filepath.Join(dir, "checks.json"); old != a.checksPath() {
+		oldInfo, err := os.Stat(old)
+		if err != nil {
+			return
+		}
+		// Keep whichever is newer.
+		if newInfo, err := os.Stat(a.checksPath()); err == nil && !oldInfo.ModTime().After(newInfo.ModTime()) {
+			os.Remove(old)
+			return
+		}
+		if os.MkdirAll(filepath.Dir(a.checksPath()), 0o700) == nil && os.Rename(old, a.checksPath()) == nil {
+			fmt.Fprintf(a.Stderr, "kx: moved check results to %s\n", tilde(a.checksPath()))
+		}
+	}
+}
+
+func (a *App) backupsDir() string { return filepath.Join(a.stateDir, "backups") }
+
+// Output is a table writer for w that honors --no-color.
+func (a *App) Output(w io.Writer) *table.Output {
+	o := table.New(w)
+	if a.NoColor {
+		o.Color = false
+	}
+	return o
+}
+
+// say prints a status line about what a command did; --quiet drops it.
+func (a *App) say(format string, args ...any) {
+	if !a.Quiet {
+		fmt.Fprintf(a.Stdout, format+"\n", args...)
+	}
 }
 
 const keepBackups = 10
@@ -55,6 +120,13 @@ type App struct {
 	Stdout io.Writer
 	Stderr io.Writer
 
+	// Set from the global flags.
+	NoColor bool // --no-color
+	NoInput bool // --no-input: never ask, fail instead
+	Quiet   bool // --quiet: no status lines
+
+	stateDir   string // backups, per XDG state
+	cacheDir   string // check results, per XDG cache
 	lastBackup string // where the last Build put the file it replaced, if anywhere
 }
 
@@ -204,7 +276,7 @@ func (a *App) Build(force bool, renames map[string]string) error {
 
 // backup keeps data as the newest backup and returns its path.
 func (a *App) backup(data []byte) (string, error) {
-	dir := a.Store.BackupsDir()
+	dir := a.backupsDir()
 	path := filepath.Join(dir, "config-"+time.Now().Format("20060102-150405.000000"))
 	if err := store.WriteFile(path, data); err != nil {
 		return "", err
@@ -232,32 +304,69 @@ func (a *App) backup(data []byte) (string, error) {
 // Rebuild is `kx build`: pull hand edits in, regenerate the target and say
 // what happened, including the foreign contexts --force drops. With force the
 // target may be unreadable, so taking hand edits in is best effort then.
-func (a *App) Rebuild(force bool) error {
-	if err := a.SyncAndReport(); err != nil && !force {
-		return err
+// dryRun says what would happen and writes nothing.
+func (a *App) Rebuild(force, dryRun bool) error {
+	if !dryRun {
+		if err := a.SyncAndReport(); err != nil && !force {
+			return err
+		}
 	}
 	var dropped []string
 	if force {
 		// Best effort: an unreadable target has nothing to list.
 		dropped, _ = a.Unmanaged()
+	} else if err := a.checkTarget(); err != nil {
+		return err
+	}
+	if dryRun {
+		n, err := a.enabledCount()
+		if err != nil {
+			return err
+		}
+		for _, d := range dropped {
+			fmt.Fprintf(a.Stdout, "would drop %s\n", d)
+		}
+		fmt.Fprintf(a.Stdout, "would write %s: %s\n", a.TargetName(), plural(n, "cluster"))
+		return nil
 	}
 	if err := a.Build(force, nil); err != nil {
 		return err
 	}
 	for _, d := range dropped {
-		fmt.Fprintf(a.Stdout, "dropped %s\n", d)
+		a.say("dropped %s", d)
 	}
 	cfg, err := a.loadTarget()
 	if err != nil {
 		return err
 	}
-	n, noun := len(cfg.Contexts), "clusters"
-	if n == 1 {
-		noun = "cluster"
-	}
-	fmt.Fprintf(a.Stdout, "wrote %s: %d %s\n", a.TargetName(), n, noun)
+	a.say("wrote %s: %s", a.TargetName(), plural(len(cfg.Contexts), "cluster"))
 	if a.lastBackup != "" {
-		fmt.Fprintf(a.Stdout, "previous version: %s\n", a.lastBackup)
+		a.say("previous version: %s", tilde(a.lastBackup))
 	}
 	return nil
+}
+
+func (a *App) enabledCount() (int, error) {
+	refs, err := a.Store.Clusters()
+	if err != nil {
+		return 0, err
+	}
+	st, err := a.Store.LoadState()
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, r := range refs {
+		if st.Enabled(r) {
+			n++
+		}
+	}
+	return n, nil
+}
+
+func plural(n int, noun string) string {
+	if n == 1 {
+		return "1 " + noun
+	}
+	return fmt.Sprintf("%d %ss", n, noun)
 }

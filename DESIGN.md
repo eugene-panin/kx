@@ -21,10 +21,14 @@ generated file.
     globex/
       main.yaml
   state.yaml           # what is turned off, plus what the last build generated
-  checks.json          # last check results
+~/.local/state/kx/
   backups/             # the last 10 versions of ~/.kube/config
+~/.cache/kx/
+  checks.json          # last check results
 
 ~/.kube/config         # built from the clusters that are on
+
+KX_HOME puts all three in one directory instead.
 ```
 
 - The main unit is the **client**. A cluster is addressed as `client/cluster`.
@@ -68,7 +72,7 @@ kx build [--force]
 | `mv` | `mv acme/old acme/new` renames a cluster, `mv unsorted/x acme` moves it to a client, `mv acme acme-corp` renames a client. |
 | `export` | Prints a kubeconfig with the given clusters to stdout, including ones that are off. |
 | `exec` | Runs a command with `KUBECONFIG` pointing at a temporary file holding just the given clusters (including ones that are off). The first one is current. Sets `KX_SCOPE`. Exits with the command's exit code. The temporary file is removed afterwards. |
-| `check` | For each cluster, in parallel: `/version` (reachable, version), then `SelfSubjectReview` (credentials work, as whom; `GET /api` before 1.28), then `/readyz?verbose` (HEALTH `ok`/`degraded` plus what failed; `/healthz` before 1.16), then nodes (NODES `ready/total`, using the Table rendering, a few hundred bytes per node). Client certificate and JWT expiry is read locally. No permission for readyz or nodes leaves the column empty. Checks the clusters that are on by default. Exits 1 if any cluster is down or degraded. Errors, failed readyz checks and outdated versions are listed under the table. Results are saved to `checks.json`. |
+| `check` | For each cluster, in parallel: `/version` (reachable, version), then `SelfSubjectReview` (credentials work, as whom; `GET /api` before 1.28), then `/readyz?verbose` (HEALTH `ok`/`degraded` plus what failed; `/healthz` before 1.16), then nodes (NODES `ready/total`, using the Table rendering, a few hundred bytes per node). Client certificate and JWT expiry is read locally. No permission for readyz or nodes leaves the column empty. Checks the clusters that are on by default. Exits 1 if any cluster is down or degraded. Errors, failed readyz checks and outdated versions are listed under the table. Results are saved to `checks.json`. A terminal gets "checking N clusters…" on stderr while it waits; Ctrl-C stops it with exit 130. |
 | `import-current` | Takes over every context in `~/.kube/config` that isn't in the store, under client `-c` (`unsorted` by default). Sort them out with `mv` afterwards. |
 | `sync` | Takes hand edits of `~/.kube/config` into the store (see below). Every command does this first; `sync` runs it alone. |
 | `build` | Rebuilds `~/.kube/config`. Every command that changes something does this on its own. |
@@ -178,7 +182,7 @@ The main use case is "someone sent a config, I drop it in, Lens picks it up":
 
 ## Cluster state
 
-- The last check results live in `~/.config/kx/checks.json`. `ls` takes
+- The last check results live in `~/.cache/kx/checks.json`. `ls` takes
   VERSION from there; the interactive mode shows version and status on start
   (muted, with "checked 2h ago" on the details line) without asking the
   clusters again. Removed clusters are dropped from the cache on the next
@@ -228,6 +232,27 @@ live next to their packages.
 Go, `cobra`, `k8s.io/client-go/tools/clientcmd` (loading, resolving relative
 paths, flattening, writing; exec plugins and other fields are carried over
 as is), bubbletea and lipgloss for the interactive mode and colors.
+
+## Global flags
+
+`--no-color` (also `NO_COLOR`, `KX_NO_COLOR`; `FORCE_COLOR` forces color),
+`--no-input` (never ask, fail where a question would be needed), `-q/--quiet`
+(no status lines such as "added …", results and errors still print).
+`rm` and `build` take `--dry-run`. In a pipe, tables print one record per line
+and empty cells as `-`, so `awk` fields don't shift.
+
+Deprecated, still working with a warning until v1: `kx add -n` (use `--name`;
+`-n` is the conventional `--dry-run`) and `kx -v` (use `--version`).
+
+## Deviations from clig.dev
+
+| rule | what kx does | why |
+|---|---|---|
+| O8 | read-only commands (`ls`, `export`, `check`) run the sync with `~/.kube/config` first, which can update the store | hand edits must never be lost, and a read that showed stale data would be worse; documented in `kx sync --help` |
+| A9 | questions are skipped with `-y/--yes`, not `-f/--force` | `--force` already means "overwrite or drop" in `add` and `build`, which is a different promise from "don't ask" |
+| D3 | no man pages | the terminal docs are `kx help <command>`, generated from the same code; the README is the web doc |
+| N1 | the name `kx` is short enough to collide with a common kubectx alias | the owner chose it; an alias shadows the binary only where one is set |
+| G1 | outside `check`, Ctrl-C ends kx at once without a message | everything else finishes in milliseconds and writes atomically, so there is nothing to clean up or report |
 
 ## Not done yet
 

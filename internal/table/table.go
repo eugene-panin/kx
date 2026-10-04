@@ -8,6 +8,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/charmbracelet/x/term"
+	"github.com/muesli/termenv"
 )
 
 const colGap = 2
@@ -31,9 +32,13 @@ func New(w io.Writer) *Output {
 		if width, _, err := term.GetSize(f.Fd()); err == nil {
 			o.Width = width
 		}
-		o.Color = os.Getenv("NO_COLOR") == "" && os.Getenv("TERM") != "dumb"
+		o.Color = os.Getenv("NO_COLOR") == "" && os.Getenv("KX_NO_COLOR") == "" && os.Getenv("TERM") != "dumb"
 	}
 	r := lipgloss.NewRenderer(w)
+	if os.Getenv("FORCE_COLOR") != "" && os.Getenv("NO_COLOR") == "" && os.Getenv("KX_NO_COLOR") == "" {
+		o.Color = true
+		r.SetColorProfile(termenv.ANSI)
+	}
 	// Basic ANSI colors follow the user's terminal theme.
 	o.Plain = r.NewStyle()
 	o.OK = r.NewStyle().Foreground(lipgloss.Color("2"))
@@ -87,6 +92,24 @@ func (o *Output) Table(cols []Column, rows []Row) error {
 // Render lays rows out to the output width. The first line is the column
 // header; the rest map one to one onto rows.
 func (o *Output) Render(cols []Column, rows []Row) []string {
+	if !o.TTY {
+		// One record per line for grep and awk: an empty cell would shift the
+		// fields after it, so it gets a placeholder.
+		filled := make([]Row, len(rows))
+		for i, r := range rows {
+			filled[i] = r
+			if r.Cells != nil {
+				filled[i].Cells = make([]Cell, len(r.Cells))
+				for k, c := range r.Cells {
+					if strings.TrimSpace(c.Text) == "" && k > 0 {
+						c.Text = "-"
+					}
+					filled[i].Cells[k] = c
+				}
+			}
+		}
+		rows = filled
+	}
 	nat := make([]int, len(cols))
 	for i, c := range cols {
 		nat[i] = ansi.StringWidth(c.Title)

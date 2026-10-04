@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -28,7 +29,7 @@ func ReadKubeconfig(path string, stdin io.Reader) (*api.Config, error) {
 			return nil, fmt.Errorf("read stdin: %w", err)
 		}
 		if cfg, err = clientcmd.Load(data); err != nil {
-			return nil, fmt.Errorf("parse stdin: %w", err)
+			return nil, notKubeconfig("stdin", err)
 		}
 		wd, err := os.Getwd()
 		if err != nil {
@@ -40,7 +41,10 @@ func ReadKubeconfig(path string, stdin io.Reader) (*api.Config, error) {
 			return nil, err
 		}
 		if cfg, err = clientcmd.LoadFromFile(origin); err != nil {
-			return nil, fmt.Errorf("load %s: %w", path, err)
+			if errors.Is(err, fs.ErrNotExist) || errors.Is(err, fs.ErrPermission) {
+				return nil, err
+			}
+			return nil, notKubeconfig(path, err)
 		}
 	}
 	for _, c := range cfg.Clusters {
@@ -176,4 +180,13 @@ func Sanitize(s string) string {
 		return "cluster"
 	}
 	return out
+}
+
+// notKubeconfig turns a decoder error into something a person can act on.
+// Go type names in "cannot unmarshal" errors mean nothing to them.
+func notKubeconfig(what string, err error) error {
+	if strings.Contains(err.Error(), "cannot unmarshal") {
+		return fmt.Errorf("%s is not a kubeconfig: expected YAML with clusters, users and contexts", what)
+	}
+	return fmt.Errorf("%s is not a kubeconfig: %w", what, err)
 }

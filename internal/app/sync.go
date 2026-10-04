@@ -144,11 +144,14 @@ func sameEntry[T *api.Cluster | *api.AuthInfo](a, b T) (bool, error) {
 }
 
 // TargetName is the target path for messages, with ~ for the home directory.
-func (a *App) TargetName() string {
+func (a *App) TargetName() string { return tilde(a.Target) }
+
+// tilde shortens a path under the home directory to ~/...
+func tilde(p string) string {
 	if home, err := os.UserHomeDir(); err == nil {
-		if rest, ok := strings.CutPrefix(a.Target, home+string(filepath.Separator)); ok {
+		if rest, ok := strings.CutPrefix(p, home+string(filepath.Separator)); ok {
 			return "~/" + rest
 		}
 	}
-	return a.Target
+	return p
 }
