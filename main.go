@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/eugene-panin/kx/internal/app"
+	"github.com/eugene-panin/kx/internal/table"
+	"github.com/eugene-panin/kx/internal/tui"
 	"github.com/spf13/cobra"
 )
 
@@ -16,7 +18,7 @@ var version = "dev"
 
 func main() {
 	err := run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr)
-	var code exitError
+	var code app.ExitError
 	switch {
 	case errors.As(err, &code):
 		os.Exit(int(code))
@@ -27,11 +29,11 @@ func main() {
 }
 
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
-	a, err := newApp(stdin, stdout, stderr)
+	a, err := app.New(stdin, stdout, stderr)
 	if err != nil {
 		return err
 	}
-	root := a.command()
+	root := cli{a}.command()
 	root.SetArgs(args)
 	root.SetIn(stdin)
 	root.SetOut(stdout)
@@ -39,34 +41,12 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	return root.Execute()
 }
 
-func newApp(stdin io.Reader, stdout, stderr io.Writer) (*app, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return nil, err
-	}
-	dir := os.Getenv("KX_HOME")
-	if dir == "" {
-		base := os.Getenv("XDG_CONFIG_HOME")
-		if base == "" {
-			base = filepath.Join(home, ".config")
-		}
-		dir = filepath.Join(base, "kx")
-	}
-	target := os.Getenv("KX_KUBECONFIG")
-	if target == "" {
-		target = filepath.Join(home, ".kube", "config")
-	}
-	if target, err = filepath.Abs(target); err != nil {
-		return nil, err
-	}
-	// Write through a symlinked kubeconfig instead of replacing the link.
-	if resolved, err := filepath.EvalSymlinks(target); err == nil {
-		target = resolved
-	}
-	return &app{store: &store{dir: dir}, target: target, stdin: stdin, stdout: stdout, stderr: stderr}, nil
+// cli wires App into cobra commands.
+type cli struct {
+	*app.App
 }
 
-func (a *app) command() *cobra.Command {
+func (a cli) command() *cobra.Command {
 	root := &cobra.Command{
 		Use:   "kx",
 		Short: "Manage kubeconfig clusters grouped by client",
@@ -78,10 +58,10 @@ Clusters are addressed as <client>/<cluster>.`,
 		SilenceErrors: true,
 		Args:          cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if !isTerminal(a.stdin) || !isTerminal(a.stdout) {
+			if !table.IsTerminal(a.Stdin) || !table.IsTerminal(a.Stdout) {
 				return cmd.Help()
 			}
-			return a.tui()
+			return tui.Run(a.App)
 		},
 	}
 
@@ -98,7 +78,7 @@ Clusters are addressed as <client>/<cluster>.`,
   kx add big.yaml -c acme --context ctx-a --context ctx-b`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return a.add(args[0], client, name, contexts, force)
+			return a.Add(args[0], client, name, contexts, force)
 		},
 	}
 	add.Flags().StringVarP(&client, "client", "c", "", "client the clusters belong to (required)")
@@ -113,7 +93,7 @@ Clusters are addressed as <client>/<cluster>.`,
 		Short: "Take over contexts in ~/.kube/config that kx does not manage yet",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return a.importCurrent(importClient)
+			return a.ImportCurrent(importClient)
 		},
 	}
 	importCurrent.Flags().StringVarP(&importClient, "client", "c", "unsorted", "client to put the contexts under")
@@ -130,7 +110,7 @@ Clusters are addressed as <client>/<cluster>.`,
 			if len(args) == 1 {
 				c = args[0]
 			}
-			return a.list(c, asJSON)
+			return a.List(c, asJSON)
 		},
 	}
 	ls.Flags().BoolVar(&asJSON, "json", false, "print JSON (no credentials included)")
@@ -141,7 +121,7 @@ Clusters are addressed as <client>/<cluster>.`,
 		Args:              cobra.MinimumNArgs(1),
 		ValidArgsFunction: a.completeRefs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return a.toggle(args, true)
+			return a.Toggle(args, true)
 		},
 	}
 	off := &cobra.Command{
@@ -150,7 +130,7 @@ Clusters are addressed as <client>/<cluster>.`,
 		Args:              cobra.MinimumNArgs(1),
 		ValidArgsFunction: a.completeRefs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return a.toggle(args, false)
+			return a.Toggle(args, false)
 		},
 	}
 
@@ -161,7 +141,7 @@ Clusters are addressed as <client>/<cluster>.`,
 		Args:              cobra.MinimumNArgs(1),
 		ValidArgsFunction: a.completeRefs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return a.remove(args, yes)
+			return a.Remove(args, yes)
 		},
 	}
 	rm.Flags().BoolVarP(&yes, "yes", "y", false, "do not ask for confirmation")
@@ -175,7 +155,7 @@ Clusters are addressed as <client>/<cluster>.`,
 		Args:              cobra.ExactArgs(2),
 		ValidArgsFunction: a.completeRefs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return a.move(args[0], args[1])
+			return a.Move(args[0], args[1])
 		},
 	}
 
@@ -191,7 +171,7 @@ no --context is given. Without arguments prints the current one.`,
 			if len(args) == 1 {
 				r = args[0]
 			}
-			return a.use(r)
+			return a.Use(r)
 		},
 	}
 
@@ -201,7 +181,7 @@ no --context is given. Without arguments prints the current one.`,
 		Args:              cobra.MinimumNArgs(1),
 		ValidArgsFunction: a.completeRefs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return a.export(args)
+			return a.Export(args)
 		},
 	}
 
@@ -214,7 +194,7 @@ KX_SCOPE is set to the requested clusters, e.g. for a shell prompt.
 
 This guards against mistakes, not a hostile process: ~/.kube/config and the
 store stay readable.`,
-		Example: `  kx exec acme -- claude
+		Example: `  kx exec acme -- $SHELL
   kx exec acme/stage -- k9s
   kx exec acme globex/main -- kubectl get nodes`,
 		ValidArgsFunction: a.completeRefs,
@@ -228,7 +208,7 @@ store stay readable.`,
 			case dash == len(args):
 				return fmt.Errorf("no command given after --")
 			}
-			return a.exec(args[:dash], args[dash:])
+			return a.Exec(args[:dash], args[dash:])
 		},
 	}
 
@@ -246,7 +226,7 @@ Expiry (days left) is read from client certificates and JWT tokens; "!" marks
 under 30 days. Errors are listed below the table; --json has full details.`,
 		ValidArgsFunction: a.completeRefs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return a.check(cmd.Context(), args, checkAll, timeout, checkJSON)
+			return a.Check(cmd.Context(), args, checkAll, timeout, checkJSON)
 		},
 	}
 	check.Flags().BoolVarP(&checkAll, "all", "a", false, "include disabled clusters")
@@ -258,10 +238,10 @@ under 30 days. Errors are listed below the table; --json has full details.`,
 		Short: "Interactive mode (also what plain `kx` runs in a terminal)",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if !isTerminal(a.stdin) || !isTerminal(a.stdout) {
+			if !table.IsTerminal(a.Stdin) || !table.IsTerminal(a.Stdout) {
 				return errors.New("kx ui needs a terminal")
 			}
-			return a.tui()
+			return tui.Run(a.App)
 		},
 	}
 
@@ -271,11 +251,7 @@ under 30 days. Errors are listed below the table; --json has full details.`,
 		Short: "Regenerate ~/.kube/config from enabled clusters",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			// With --force the target may be unreadable; namespaces are best effort then.
-			if err := a.syncNamespaces(); err != nil && !buildForce {
-				return err
-			}
-			return a.build(buildForce, nil)
+			return a.Rebuild(buildForce)
 		},
 	}
 	build.Flags().BoolVar(&buildForce, "force", false, "drop contexts kx does not manage")
@@ -284,18 +260,18 @@ under 30 days. Errors are listed below the table; --json has full details.`,
 	return root
 }
 
-func (a *app) completeRefs(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-	refs, err := a.store.clusters()
+func (a cli) completeRefs(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+	refs, err := a.Store.Clusters()
 	if err != nil {
 		return nil, cobra.ShellCompDirectiveError
 	}
 	var out []string
 	last := ""
 	for _, r := range refs {
-		if r.client != last && strings.HasPrefix(r.client, toComplete) {
-			out = append(out, r.client)
+		if r.Client != last && strings.HasPrefix(r.Client, toComplete) {
+			out = append(out, r.Client)
 		}
-		last = r.client
+		last = r.Client
 		if strings.HasPrefix(r.String(), toComplete) {
 			out = append(out, r.String())
 		}
@@ -303,18 +279,18 @@ func (a *app) completeRefs(cmd *cobra.Command, args []string, toComplete string)
 	return out, cobra.ShellCompDirectiveNoFileComp
 }
 
-func (a *app) completeClients(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+func (a cli) completeClients(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 	if len(args) > 0 {
 		return nil, cobra.ShellCompDirectiveNoFileComp
 	}
-	refs, err := a.store.clusters()
+	refs, err := a.Store.Clusters()
 	if err != nil {
 		return nil, cobra.ShellCompDirectiveError
 	}
 	var out []string
 	for _, r := range refs {
-		if (len(out) == 0 || out[len(out)-1] != r.client) && strings.HasPrefix(r.client, toComplete) {
-			out = append(out, r.client)
+		if (len(out) == 0 || out[len(out)-1] != r.Client) && strings.HasPrefix(r.Client, toComplete) {
+			out = append(out, r.Client)
 		}
 	}
 	return out, cobra.ShellCompDirectiveNoFileComp

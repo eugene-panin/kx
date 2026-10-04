@@ -1,4 +1,4 @@
-package main
+package app
 
 import (
 	"bufio"
@@ -7,28 +7,31 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/eugene-panin/kx/internal/probe"
+	"github.com/eugene-panin/kx/internal/store"
+	"github.com/eugene-panin/kx/internal/table"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/clientcmd/api"
 )
 
-func (a *app) add(src, client, name string, contexts []string, force bool) error {
-	if !validName(client) {
+func (a *App) Add(src, client, name string, contexts []string, force bool) error {
+	if !store.ValidName(client) {
 		return fmt.Errorf("invalid client name %q", client)
 	}
 	if src != "-" {
-		if abs, err := filepath.Abs(src); err == nil && abs == a.target {
+		if abs, err := filepath.Abs(src); err == nil && abs == a.Target {
 			return fmt.Errorf("%s is the file kx generates; use `kx import-current` to take over its contexts", src)
 		}
 	}
 	if err := a.prepare(); err != nil {
 		return err
 	}
-	cfg, err := readKubeconfig(src, a.stdin)
+	cfg, err := store.ReadKubeconfig(src, a.Stdin)
 	if err != nil {
 		return err
 	}
 	if len(contexts) == 0 {
-		contexts = contextNames(cfg)
+		contexts = store.ContextNames(cfg)
 	}
 	switch {
 	case len(contexts) == 0:
@@ -38,92 +41,92 @@ func (a *app) add(src, client, name string, contexts []string, force bool) error
 	}
 
 	type item struct {
-		r   ref
+		r   store.Ref
 		cfg *api.Config
 	}
 	var items []item
-	seen := map[ref]string{}
+	seen := map[store.Ref]string{}
 	for _, ctx := range contexts {
 		cluster := name
 		if cluster == "" {
-			cluster = sanitize(ctx)
+			cluster = store.Sanitize(ctx)
 		}
-		if !validName(cluster) {
+		if !store.ValidName(cluster) {
 			return fmt.Errorf("invalid cluster name %q", cluster)
 		}
-		r := ref{client: client, cluster: cluster}
+		r := store.Ref{Client: client, Cluster: cluster}
 		if prev, dup := seen[r]; dup {
 			return fmt.Errorf("contexts %q and %q both map to %s; add them one by one with --context and --name", prev, ctx, r)
 		}
 		seen[r] = ctx
-		if !force && a.store.exists(r) {
+		if !force && a.Store.Exists(r) {
 			return fmt.Errorf("%s already exists; use --force to overwrite or --name to pick another name", r)
 		}
-		one, err := extract(cfg, ctx, r.String())
+		one, err := store.Extract(cfg, ctx, r.String())
 		if err != nil {
 			return err
 		}
 		items = append(items, item{r, one})
 	}
 	for _, it := range items {
-		if err := a.store.put(it.r, it.cfg); err != nil {
+		if err := a.Store.Put(it.r, it.cfg); err != nil {
 			return err
 		}
-		fmt.Fprintf(a.stdout, "added %s\t%s\n", it.r, it.cfg.Clusters[it.r.String()].Server)
+		fmt.Fprintf(a.Stdout, "added %s\t%s\n", it.r, it.cfg.Clusters[it.r.String()].Server)
 	}
-	return a.build(false, nil)
+	return a.Build(false, nil)
 }
 
-func (a *app) importCurrent(client string) error {
-	if !validName(client) {
+func (a *App) ImportCurrent(client string) error {
+	if !store.ValidName(client) {
 		return fmt.Errorf("invalid client name %q", client)
 	}
 	if err := a.syncNamespaces(); err != nil {
 		return err
 	}
-	names, err := a.unmanaged()
+	names, err := a.Unmanaged()
 	if err != nil {
 		return err
 	}
 	if len(names) == 0 {
-		fmt.Fprintln(a.stdout, "nothing to import")
+		fmt.Fprintln(a.Stdout, "nothing to import")
 		return nil
 	}
-	cfg, err := readKubeconfig(a.target, nil)
+	cfg, err := store.ReadKubeconfig(a.Target, nil)
 	if err != nil {
 		return err
 	}
-	taken := map[ref]bool{}
+	taken := map[store.Ref]bool{}
 	renames := map[string]string{}
 	for _, ctx := range names {
-		r := ref{client: client, cluster: sanitize(ctx)}
-		for i, base := 2, r.cluster; taken[r] || a.store.exists(r); i++ {
-			r.cluster = fmt.Sprintf("%s-%d", base, i)
+		r := store.Ref{Client: client, Cluster: store.Sanitize(ctx)}
+		for i, base := 2, r.Cluster; taken[r] || a.Store.Exists(r); i++ {
+			r.Cluster = fmt.Sprintf("%s-%d", base, i)
 		}
 		taken[r] = true
-		one, err := extract(cfg, ctx, r.String())
+		one, err := store.Extract(cfg, ctx, r.String())
 		if err != nil {
 			return err
 		}
-		if err := a.store.put(r, one); err != nil {
+		if err := a.Store.Put(r, one); err != nil {
 			return err
 		}
 		renames[ctx] = r.String()
-		fmt.Fprintf(a.stdout, "imported %s as %s\n", ctx, r)
+		fmt.Fprintf(a.Stdout, "imported %s as %s\n", ctx, r)
 	}
 	// The originals now live in the store under new names; let the build drop them.
-	st, err := a.store.loadState()
+	st, err := a.Store.LoadState()
 	if err != nil {
 		return err
 	}
 	st.Generated = append(st.Generated, names...)
-	if err := a.store.saveState(st); err != nil {
+	if err := a.Store.SaveState(st); err != nil {
 		return err
 	}
-	return a.build(false, renames)
+	return a.Build(false, renames)
 }
 
-type listRow struct {
+type ListRow struct {
 	Client    string `json:"client"`
 	Cluster   string `json:"cluster"`
 	Context   string `json:"context"`
@@ -134,13 +137,13 @@ type listRow struct {
 	Current   bool   `json:"current"`
 }
 
-// rows describes every stored cluster as ls shows it.
-func (a *app) rows() ([]listRow, *state, error) {
-	refs, err := a.store.clusters()
+// Rows describes every stored cluster as ls shows it.
+func (a *App) Rows() ([]ListRow, *store.State, error) {
+	refs, err := a.Store.Clusters()
 	if err != nil {
 		return nil, nil, err
 	}
-	st, err := a.store.loadState()
+	st, err := a.Store.LoadState()
 	if err != nil {
 		return nil, nil, err
 	}
@@ -148,22 +151,22 @@ func (a *app) rows() ([]listRow, *state, error) {
 	if err != nil {
 		cur = api.NewConfig()
 	}
-	checks, err := a.store.loadChecks()
+	checks, err := a.LoadChecks()
 	if err != nil {
 		return nil, nil, err
 	}
-	rows := []listRow{}
+	rows := []ListRow{}
 	for _, r := range refs {
-		cfg, err := a.store.get(r)
+		cfg, err := a.Store.Get(r)
 		if err != nil {
 			return nil, nil, err
 		}
-		row := listRow{
-			Client:  r.client,
-			Cluster: r.cluster,
+		row := ListRow{
+			Client:  r.Client,
+			Cluster: r.Cluster,
 			Context: r.String(),
 			Version: checks[r.String()].Version,
-			Enabled: st.enabled(r),
+			Enabled: st.Enabled(r),
 			Current: r.String() == cur.CurrentContext,
 		}
 		if ctx := cfg.Contexts[r.String()]; ctx != nil {
@@ -181,12 +184,12 @@ func (a *app) rows() ([]listRow, *state, error) {
 	return rows, st, nil
 }
 
-func (a *app) list(client string, asJSON bool) error {
-	all, st, err := a.rows()
+func (a *App) List(client string, asJSON bool) error {
+	all, st, err := a.Rows()
 	if err != nil {
 		return err
 	}
-	rows := []listRow{}
+	rows := []ListRow{}
 	for _, r := range all {
 		if client == "" || r.Client == client {
 			rows = append(rows, r)
@@ -197,20 +200,20 @@ func (a *app) list(client string, asJSON bool) error {
 	}
 
 	if asJSON {
-		enc := json.NewEncoder(a.stdout)
+		enc := json.NewEncoder(a.Stdout)
 		enc.SetIndent("", "  ")
 		return enc.Encode(rows)
 	}
 	if len(rows) == 0 {
-		fmt.Fprintln(a.stderr, "no clusters yet: kx add <kubeconfig> -c <client>")
+		fmt.Fprintln(a.Stderr, "no clusters yet: kx add <kubeconfig> -c <client>")
 		return nil
 	}
 
-	o := newOutput(a.stdout)
-	if !o.tty {
+	o := table.New(a.Stdout)
+	if !o.TTY {
 		// One line per cluster with the client on it, so grep keeps working.
-		cols := []column{{}, {title: "CLIENT"}, {title: "CLUSTER"}, {title: "SERVER"}, {title: "NAMESPACE"}, {title: "VERSION"}, {title: "STATE"}}
-		var out []row
+		cols := []table.Column{{}, {Title: "CLIENT"}, {Title: "CLUSTER"}, {Title: "SERVER"}, {Title: "NAMESPACE"}, {Title: "VERSION"}, {Title: "STATE"}}
+		var out []table.Row
 		for _, r := range rows {
 			mark, state := " ", "on"
 			if r.Current {
@@ -219,64 +222,64 @@ func (a *app) list(client string, asJSON bool) error {
 			if !r.Enabled {
 				state = "off"
 			}
-			out = append(out, row{cells: []cell{{text: mark}, {text: r.Client}, {text: r.Cluster}, {text: r.Server}, {text: r.Namespace}, {text: r.Version}, {text: state}}})
+			out = append(out, table.Row{Cells: []table.Cell{{Text: mark}, {Text: r.Client}, {Text: r.Cluster}, {Text: r.Server}, {Text: r.Namespace}, {Text: r.Version}, {Text: state}}})
 		}
-		return o.table(cols, out)
+		return o.Table(cols, out)
 	}
 
-	known, err := a.store.loadChecks()
+	known, err := a.LoadChecks()
 	if err != nil {
 		return err
 	}
-	policy := newVersionPolicy(known)
-	cols := []column{
+	policy := probe.NewVersionPolicy(known)
+	cols := []table.Column{
 		{},
-		{title: "CLUSTER", shrink: 12},
-		{title: "SERVER", shrink: 16, trim: true},
-		{title: "NAMESPACE", drop: 1},
-		{title: "VERSION", drop: 2},
-		{title: "STATE"},
+		{Title: "CLUSTER", Shrink: 12},
+		{Title: "SERVER", Shrink: 16, Trim: true},
+		{Title: "NAMESPACE", Drop: 1},
+		{Title: "VERSION", Drop: 2},
+		{Title: "STATE"},
 	}
-	var out []row
+	var out []table.Row
 	last := ""
 	for _, r := range rows {
 		if r.Client != last {
 			last = r.Client
-			title := o.paint(o.title, r.Client)
-			if !st.enabled(ref{client: r.Client}) {
-				title += " " + o.paint(o.dim, "off")
+			title := o.Paint(o.Title, r.Client)
+			if !st.Enabled(store.Ref{Client: r.Client}) {
+				title += " " + o.Paint(o.Dim, "off")
 			}
-			out = append(out, row{title: title})
+			out = append(out, table.Row{Title: title})
 		}
-		base := o.plain
+		base := o.Plain
 		if !r.Enabled {
-			base = o.dim
+			base = o.Dim
 		}
-		mark, name, state := cell{"  ", base}, cell{r.Cluster, base}, cell{"on", o.ok}
+		mark, name, state := table.Cell{Text: "  ", Style: base}, table.Cell{Text: r.Cluster, Style: base}, table.Cell{Text: "on", Style: o.OK}
 		if r.Current {
-			mark, name.style = cell{" *", o.ok}, o.bold
+			mark, name.Style = table.Cell{Text: " *", Style: o.OK}, o.Bold
 		}
 		if !r.Enabled {
-			state = cell{"off", o.dim}
+			state = table.Cell{Text: "off", Style: o.Dim}
 		}
-		version := o.versionCell(r.Version, policy)
+		version := VersionCell(o, r.Version, policy)
 		if !r.Enabled {
-			version.style = o.dim
+			version.Style = o.Dim
 		}
-		out = append(out, row{cells: []cell{mark, name, {r.Server, base}, {r.Namespace, base}, version, state}})
+		out = append(out, table.Row{Cells: []table.Cell{mark, name, {Text: r.Server, Style: base}, {Text: r.Namespace, Style: base}, version, state}})
 	}
-	return o.table(cols, out)
+	return o.Table(cols, out)
 }
 
-func (a *app) toggle(args []string, on bool) error {
+func (a *App) Toggle(args []string, on bool) error {
 	if err := a.prepare(); err != nil {
 		return err
 	}
-	all, err := a.store.clusters()
+	all, err := a.Store.Clusters()
 	if err != nil {
 		return err
 	}
-	st, err := a.store.loadState()
+	st, err := a.Store.LoadState()
 	if err != nil {
 		return err
 	}
@@ -285,28 +288,28 @@ func (a *app) toggle(args []string, on bool) error {
 		word = "on"
 	}
 	for _, arg := range args {
-		if _, err := a.store.expand([]string{arg}); err != nil {
+		if _, err := a.Store.Expand([]string{arg}); err != nil {
 			return err
 		}
-		r, _ := parseRef(arg)
+		r, _ := store.ParseRef(arg)
 		if on {
-			st.enable(r, all)
+			st.Enable(r, all)
 		} else {
-			st.disable(r)
+			st.Disable(r)
 		}
-		fmt.Fprintf(a.stdout, "%s: %s\n", r, word)
+		fmt.Fprintf(a.Stdout, "%s: %s\n", r, word)
 	}
-	if err := a.store.saveState(st); err != nil {
+	if err := a.Store.SaveState(st); err != nil {
 		return err
 	}
-	return a.build(false, nil)
+	return a.Build(false, nil)
 }
 
-func (a *app) remove(args []string, yes bool) error {
+func (a *App) Remove(args []string, yes bool) error {
 	if err := a.prepare(); err != nil {
 		return err
 	}
-	refs, err := a.store.expand(args)
+	refs, err := a.Store.Expand(args)
 	if err != nil {
 		return err
 	}
@@ -320,50 +323,50 @@ func (a *app) remove(args []string, yes bool) error {
 			return err
 		}
 		if !ok {
-			fmt.Fprintln(a.stderr, "aborted")
+			fmt.Fprintln(a.Stderr, "aborted")
 			return nil
 		}
 	}
 	for _, r := range refs {
-		if err := a.store.remove(r); err != nil {
+		if err := a.Store.Remove(r); err != nil {
 			return err
 		}
-		fmt.Fprintf(a.stdout, "removed %s\n", r)
+		fmt.Fprintf(a.Stdout, "removed %s\n", r)
 	}
 	if err := a.pruneState(); err != nil {
 		return err
 	}
-	return a.build(false, nil)
+	return a.Build(false, nil)
 }
 
-func (a *app) move(fromArg, toArg string) error {
-	from, err := parseRef(fromArg)
+func (a *App) Move(fromArg, toArg string) error {
+	from, err := store.ParseRef(fromArg)
 	if err != nil {
 		return err
 	}
-	to, err := parseRef(toArg)
+	to, err := store.ParseRef(toArg)
 	if err != nil {
 		return err
 	}
 	if err := a.prepare(); err != nil {
 		return err
 	}
-	srcs, err := a.store.expand([]string{fromArg})
+	srcs, err := a.Store.Expand([]string{fromArg})
 	if err != nil {
 		return err
 	}
 
-	type pair struct{ from, to ref }
+	type pair struct{ from, to store.Ref }
 	var moves []pair
 	switch {
-	case from.cluster == "" && to.cluster != "":
+	case from.Cluster == "" && to.Cluster != "":
 		return fmt.Errorf("cannot move client %s into cluster %s", from, to)
-	case from.cluster == "":
+	case from.Cluster == "":
 		for _, s := range srcs {
-			moves = append(moves, pair{s, ref{client: to.client, cluster: s.cluster}})
+			moves = append(moves, pair{s, store.Ref{Client: to.Client, Cluster: s.Cluster}})
 		}
-	case to.cluster == "":
-		moves = []pair{{from, ref{client: to.client, cluster: from.cluster}}}
+	case to.Cluster == "":
+		moves = []pair{{from, store.Ref{Client: to.Client, Cluster: from.Cluster}}}
 	default:
 		moves = []pair{{from, to}}
 	}
@@ -371,38 +374,38 @@ func (a *app) move(fromArg, toArg string) error {
 		if m.from == m.to {
 			return fmt.Errorf("%s: source and destination are the same", m.from)
 		}
-		if a.store.exists(m.to) {
+		if a.Store.Exists(m.to) {
 			return fmt.Errorf("%s already exists", m.to)
 		}
 	}
 
-	st, err := a.store.loadState()
+	st, err := a.Store.LoadState()
 	if err != nil {
 		return err
 	}
 	renames := map[string]string{}
 	for _, m := range moves {
 		renames[m.from.String()] = m.to.String()
-		wasOff := !st.enabled(m.from)
-		if err := a.store.move(m.from, m.to); err != nil {
+		wasOff := !st.Enabled(m.from)
+		if err := a.Store.Move(m.from, m.to); err != nil {
 			return err
 		}
 		if wasOff {
 			st.Disabled = append(st.Disabled, m.to.String())
 		}
-		fmt.Fprintf(a.stdout, "moved %s -> %s\n", m.from, m.to)
+		fmt.Fprintf(a.Stdout, "moved %s -> %s\n", m.from, m.to)
 	}
-	if err := a.store.saveState(st); err != nil {
+	if err := a.Store.SaveState(st); err != nil {
 		return err
 	}
 	if err := a.pruneState(); err != nil {
 		return err
 	}
-	return a.build(false, renames)
+	return a.Build(false, renames)
 }
 
-func (a *app) export(args []string) error {
-	refs, err := a.store.expand(args)
+func (a *App) Export(args []string) error {
+	refs, err := a.Store.Expand(args)
 	if err != nil {
 		return err
 	}
@@ -414,40 +417,40 @@ func (a *app) export(args []string) error {
 	if err != nil {
 		return err
 	}
-	_, err = a.stdout.Write(data)
+	_, err = a.Stdout.Write(data)
 	return err
 }
 
-// use sets current-context. Only that field changes, so switching back and
+// Use sets current-context. Only that field changes, so switching back and
 // forth does not churn the backups the way a rebuild would.
-func (a *app) use(arg string) error {
+func (a *App) Use(arg string) error {
 	if arg == "" {
 		cfg, err := a.loadTarget()
 		if err != nil {
 			return err
 		}
 		if cfg.CurrentContext == "" {
-			fmt.Fprintln(a.stderr, "no current context")
+			fmt.Fprintln(a.Stderr, "no current context")
 			return nil
 		}
-		fmt.Fprintln(a.stdout, cfg.CurrentContext)
+		fmt.Fprintln(a.Stdout, cfg.CurrentContext)
 		return nil
 	}
-	r, err := parseRef(arg)
+	r, err := store.ParseRef(arg)
 	if err != nil {
 		return err
 	}
-	if r.cluster == "" {
+	if r.Cluster == "" {
 		return fmt.Errorf("%s is a client; use takes a cluster: %s/<cluster>", r, r)
 	}
-	if !a.store.exists(r) {
+	if !a.Store.Exists(r) {
 		return fmt.Errorf("%s: not found", r)
 	}
-	st, err := a.store.loadState()
+	st, err := a.Store.LoadState()
 	if err != nil {
 		return err
 	}
-	if !st.enabled(r) {
+	if !st.Enabled(r) {
 		return fmt.Errorf("%s is off; turn it on first", r)
 	}
 	cfg, err := a.loadTarget()
@@ -456,7 +459,7 @@ func (a *app) use(arg string) error {
 	}
 	if cfg.Contexts[r.String()] == nil {
 		// Enabled but missing: the target was edited by hand. Bring it back.
-		if err := a.build(false, nil); err != nil {
+		if err := a.Build(false, nil); err != nil {
 			return err
 		}
 		if cfg, err = a.loadTarget(); err != nil {
@@ -469,32 +472,32 @@ func (a *app) use(arg string) error {
 		if err != nil {
 			return err
 		}
-		if err := writeFile(a.target, data); err != nil {
+		if err := store.WriteFile(a.Target, data); err != nil {
 			return err
 		}
 	}
-	fmt.Fprintf(a.stdout, "using %s\n", r)
+	fmt.Fprintf(a.Stdout, "using %s\n", r)
 	return nil
 }
 
-func (a *app) pruneState() error {
-	refs, err := a.store.clusters()
+func (a *App) pruneState() error {
+	refs, err := a.Store.Clusters()
 	if err != nil {
 		return err
 	}
-	st, err := a.store.loadState()
+	st, err := a.Store.LoadState()
 	if err != nil {
 		return err
 	}
-	st.prune(refs)
-	return a.store.saveState(st)
+	st.Prune(refs)
+	return a.Store.SaveState(st)
 }
 
-func (a *app) confirm(question string) (bool, error) {
-	fmt.Fprintf(a.stderr, "%s [y/N] ", question)
-	line, err := bufio.NewReader(a.stdin).ReadString('\n')
+func (a *App) confirm(question string) (bool, error) {
+	fmt.Fprintf(a.Stderr, "%s [y/N] ", question)
+	line, err := bufio.NewReader(a.Stdin).ReadString('\n')
 	if err != nil && line == "" {
-		fmt.Fprintln(a.stderr)
+		fmt.Fprintln(a.Stderr)
 		return false, fmt.Errorf("no confirmation; pass -y to skip it")
 	}
 	switch strings.ToLower(strings.TrimSpace(line)) {

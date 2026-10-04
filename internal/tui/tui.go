@@ -1,4 +1,4 @@
-package main
+package tui
 
 import (
 	"bytes"
@@ -19,6 +19,10 @@ import (
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/eugene-panin/kx/internal/app"
+	"github.com/eugene-panin/kx/internal/probe"
+	"github.com/eugene-panin/kx/internal/store"
+	"github.com/eugene-panin/kx/internal/table"
 	"k8s.io/client-go/tools/clientcmd"
 )
 
@@ -55,7 +59,7 @@ var keys = keyMap{
 // item is a line of the tree: a client header or one of its clusters.
 type item struct {
 	client string
-	row    *listRow // nil for a client header
+	row    *app.ListRow // nil for a client header
 }
 
 func (it item) ref() string {
@@ -78,9 +82,9 @@ const (
 
 type (
 	loadedMsg struct {
-		rows    []listRow
-		checks  map[string]checkResult
-		st      *state
+		rows    []app.ListRow
+		checks  map[string]probe.Result
+		st      *store.State
 		foreign []string
 		err     error
 	}
@@ -88,7 +92,7 @@ type (
 		status string
 		err    error
 	}
-	checkMsg struct{ res checkResult }
+	checkMsg struct{ res probe.Result }
 	savedMsg struct{ err error }
 )
 
@@ -97,11 +101,11 @@ type (
 const fixedLines = 5
 
 type model struct {
-	a *app
-	o *output
+	a *app.App
+	o *table.Output
 
-	rows    []listRow
-	st      *state
+	rows    []app.ListRow
+	st      *store.State
 	foreign []string
 	items   []item
 	cursor  int
@@ -118,7 +122,7 @@ type model struct {
 	failed  bool
 	busy    bool
 
-	checks   map[string]checkResult // this session's and remembered ones
+	checks   map[string]probe.Result // this session's and remembered ones
 	checking map[string]bool
 	started  time.Time // results older than this come from the cache
 	sem      chan struct{}
@@ -130,7 +134,7 @@ type model struct {
 	clipboard func() ([]byte, error)
 }
 
-func newModel(a *app) model {
+func newModel(a *app.App) model {
 	in := textinput.New()
 	in.CharLimit = 4096
 	in.Cursor.SetMode(cursor.CursorStatic)
@@ -138,12 +142,12 @@ func newModel(a *app) model {
 	sp.Spinner = spinner.MiniDot
 	return model{
 		a:         a,
-		o:         newOutput(a.stdout),
+		o:         table.New(a.Stdout),
 		input:     in,
-		checks:    map[string]checkResult{},
+		checks:    map[string]probe.Result{},
 		checking:  map[string]bool{},
 		started:   time.Now(),
-		sem:       make(chan struct{}, checkParallel),
+		sem:       make(chan struct{}, probe.Parallel),
 		timeout:   5 * time.Second,
 		spin:      sp,
 		help:      help.New(),
@@ -151,7 +155,8 @@ func newModel(a *app) model {
 	}
 }
 
-func (a *app) tui() error {
+// Run opens the interactive mode until the user quits.
+func Run(a *app.App) error {
 	stderr := os.Stderr
 	// Exec auth plugins (aws, gke-gcloud-auth-plugin, ...) write straight to
 	// os.Stderr and would garble the screen while checks run.
@@ -162,7 +167,7 @@ func (a *app) tui() error {
 			null.Close()
 		}()
 	}
-	p := tea.NewProgram(newModel(a), tea.WithAltScreen(), tea.WithInput(a.stdin), tea.WithOutput(a.stdout))
+	p := tea.NewProgram(newModel(a), tea.WithAltScreen(), tea.WithInput(a.Stdin), tea.WithOutput(a.Stdout))
 	_, err := p.Run()
 	return err
 }
@@ -172,21 +177,21 @@ func (m model) Init() tea.Cmd { return m.load() }
 func (m model) load() tea.Cmd {
 	a := m.a
 	return func() tea.Msg {
-		rows, st, err := a.rows()
+		rows, st, err := a.Rows()
 		if err != nil {
 			return loadedMsg{err: err}
 		}
-		checks, err := a.store.loadChecks()
+		checks, err := a.LoadChecks()
 		if err != nil {
 			return loadedMsg{err: err}
 		}
-		foreign, err := a.unmanaged()
+		foreign, err := a.Unmanaged()
 		return loadedMsg{rows: rows, checks: checks, st: st, foreign: foreign, err: err}
 	}
 }
 
 // mutate runs a regular kx command with its output captured for the status line.
-func (m model) mutate(fn func(q *app) error) (tea.Model, tea.Cmd) {
+func (m model) mutate(fn func(q *app.App) error) (tea.Model, tea.Cmd) {
 	if m.busy {
 		return m, nil
 	}
@@ -195,7 +200,7 @@ func (m model) mutate(fn func(q *app) error) (tea.Model, tea.Cmd) {
 	return m, func() tea.Msg {
 		var out bytes.Buffer
 		q := *a
-		q.stdin, q.stdout, q.stderr = strings.NewReader(""), &out, io.Discard
+		q.Stdin, q.Stdout, q.Stderr = strings.NewReader(""), &out, io.Discard
 		err := fn(&q)
 		return doneMsg{status: summarize(out.String()), err: err}
 	}
@@ -210,31 +215,31 @@ func summarize(out string) string {
 	return first
 }
 
-func (m model) probe(r ref) tea.Cmd {
+func (m model) probeCmd(r store.Ref) tea.Cmd {
 	a, sem, timeout := m.a, m.sem, m.timeout
 	return func() tea.Msg {
 		sem <- struct{}{}
 		defer func() { <-sem }()
-		cfg, err := a.store.get(r)
+		cfg, err := a.Store.Get(r)
 		if err != nil {
-			return checkMsg{checkResult{Context: r.String(), Status: "error", Error: err.Error()}}
+			return checkMsg{probe.Result{Context: r.String(), Status: "error", Error: err.Error()}}
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
-		return checkMsg{probe(ctx, cfg, r.String())}
+		return checkMsg{probe.Probe(ctx, cfg, r.String())}
 	}
 }
 
 // saveChecks remembers this session's results for ls, check and the next start.
 func (m model) saveChecks() tea.Cmd {
-	var fresh []checkResult
+	var fresh []probe.Result
 	for _, res := range m.checks {
 		if res.CheckedAt.After(m.started) {
 			fresh = append(fresh, res)
 		}
 	}
-	s := m.a.store
-	return func() tea.Msg { return savedMsg{s.saveChecks(fresh)} }
+	a := m.a
+	return func() tea.Msg { return savedMsg{a.SaveChecks(fresh)} }
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -333,7 +338,7 @@ func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.status = "nothing to import"
 			return m, nil
 		}
-		return m.mutate(func(q *app) error { return q.importCurrent("unsorted") })
+		return m.mutate(func(q *app.App) error { return q.ImportCurrent("unsorted") })
 	case key.Matches(msg, keys.Check):
 		return m.startChecks()
 	}
@@ -350,10 +355,10 @@ func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.status, m.failed = "pick a cluster of "+it.client, true
 			return m, nil
 		}
-		return m.mutate(func(q *app) error { return q.use(ref) })
+		return m.mutate(func(q *app.App) error { return q.Use(ref) })
 	case key.Matches(msg, keys.Toggle):
 		on := !m.enabled(it)
-		return m.mutate(func(q *app) error { return q.toggle([]string{ref}, on) })
+		return m.mutate(func(q *app.App) error { return q.Toggle([]string{ref}, on) })
 	case key.Matches(msg, keys.Rename):
 		return m.prompt(modeRename, "rename "+ref+" → ", ref)
 	case key.Matches(msg, keys.Delete):
@@ -375,7 +380,7 @@ func (m model) updateInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.mode = modeNormal
 		if it, ok := m.current(); ok && msg.String() == "y" {
 			ref := it.ref()
-			return m.mutate(func(q *app) error { return q.remove([]string{ref}, true) })
+			return m.mutate(func(q *app.App) error { return q.Remove([]string{ref}, true) })
 		}
 		return m, nil
 	}
@@ -400,7 +405,7 @@ func (m model) updateInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			from := it.ref()
-			return m.mutate(func(q *app) error { return q.move(from, val) })
+			return m.mutate(func(q *app.App) error { return q.Move(from, val) })
 		case modeAddPath:
 			if val == "" {
 				return m, nil
@@ -423,12 +428,12 @@ func (m model) updateInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			path, data := m.addPath, m.addData
-			return m.mutate(func(q *app) error {
+			return m.mutate(func(q *app.App) error {
 				if data != nil {
-					q.stdin = bytes.NewReader(data)
-					return q.add("-", val, "", nil, false)
+					q.Stdin = bytes.NewReader(data)
+					return q.Add("-", val, "", nil, false)
 				}
-				return q.add(path, val, "", nil, false)
+				return q.Add(path, val, "", nil, false)
 			})
 		}
 		return m, nil
@@ -451,7 +456,7 @@ func (m model) startChecks() (tea.Model, tea.Cmd) {
 			continue
 		}
 		m.checking[it.row.Context] = true
-		cmds = append(cmds, m.probe(ref{client: it.row.Client, cluster: it.row.Cluster}))
+		cmds = append(cmds, m.probeCmd(store.Ref{Client: it.row.Client, Cluster: it.row.Cluster}))
 	}
 	if len(cmds) > 0 && !ticking {
 		cmds = append(cmds, m.spin.Tick)
@@ -504,7 +509,7 @@ func (m model) enabled(it item) bool {
 	if it.row != nil {
 		return it.row.Enabled
 	}
-	return m.st == nil || m.st.enabled(ref{client: it.client})
+	return m.st == nil || m.st.Enabled(store.Ref{Client: it.client})
 }
 
 func (m model) current() (item, bool) {
@@ -567,10 +572,10 @@ func (m model) View() string {
 	}
 	o := *m.o
 	// Without color the selection has no highlight, so it gets a gutter mark.
-	gutter := !o.color
-	o.width = m.width
+	gutter := !o.Color
+	o.Width = m.width
 	if gutter {
-		o.width -= 2
+		o.Width -= 2
 	}
 	fitLine := func(s string) string { return ansi.Truncate(s, m.width-1, "…") }
 
@@ -581,27 +586,27 @@ func (m model) View() string {
 			clients++
 		}
 	}
-	title := o.paint(o.title, "kx") + o.paint(o.dim, fmt.Sprintf("  %d clusters · %d clients", len(m.rows), clients))
+	title := o.Paint(o.Title, "kx") + o.Paint(o.Dim, fmt.Sprintf("  %d clusters · %d clients", len(m.rows), clients))
 	if m.filter != "" && m.mode != modeFilter {
-		title += o.paint(o.warn, "  /"+m.filter)
+		title += o.Paint(o.Warn, "  /"+m.filter)
 	}
 	b.WriteString(fitLine(title) + "\n")
 
-	cols := []column{
+	cols := []table.Column{
 		{},
-		{title: "CLUSTER", shrink: 12},
-		{title: "SERVER", shrink: 16, trim: true, drop: 2},
-		{title: "NAMESPACE", drop: 1},
-		{title: "VERSION", drop: 3},
-		{title: "STATE"},
-		{title: "CHECK", drop: 4},
+		{Title: "CLUSTER", Shrink: 12},
+		{Title: "SERVER", Shrink: 16, Trim: true, Drop: 2},
+		{Title: "NAMESPACE", Drop: 1},
+		{Title: "VERSION", Drop: 3},
+		{Title: "STATE"},
+		{Title: "CHECK", Drop: 4},
 	}
-	policy := newVersionPolicy(m.checks)
-	rows := make([]row, len(m.items))
+	policy := probe.NewVersionPolicy(m.checks)
+	rows := make([]table.Row, len(m.items))
 	for i, it := range m.items {
 		rows[i] = m.itemRow(&o, it, policy)
 	}
-	lines := o.render(cols, rows)
+	lines := o.Render(cols, rows)
 	if gutter {
 		for i := range lines {
 			lines[i] = "  " + lines[i]
@@ -616,12 +621,12 @@ func (m model) View() string {
 			if m.filter != "" {
 				hint = "nothing matches /" + m.filter
 			}
-			b.WriteString(o.paint(o.dim, fitLine(hint)))
+			b.WriteString(o.Paint(o.Dim, fitLine(hint)))
 		case i < len(body) && i == m.cursor && gutter:
 			b.WriteString("> " + body[i][2:])
 		case i < len(body) && i == m.cursor:
 			plain := ansi.Strip(body[i])
-			b.WriteString(o.paint(o.sel, plain+strings.Repeat(" ", max(0, m.width-1-ansi.StringWidth(plain)))))
+			b.WriteString(o.Paint(o.Sel, plain+strings.Repeat(" ", max(0, m.width-1-ansi.StringWidth(plain)))))
 		case i < len(body):
 			b.WriteString(body[i])
 		}
@@ -633,67 +638,49 @@ func (m model) View() string {
 	return b.String()
 }
 
-func (m model) itemRow(o *output, it item, policy versionPolicy) row {
+func (m model) itemRow(o *table.Output, it item, policy probe.VersionPolicy) table.Row {
 	if it.row == nil {
-		t := o.paint(o.title, it.client)
+		t := o.Paint(o.Title, it.client)
 		if !m.enabled(it) {
-			t += " " + o.paint(o.dim, "off")
+			t += " " + o.Paint(o.Dim, "off")
 		}
-		return row{title: t}
+		return table.Row{Title: t}
 	}
 	r := it.row
-	base := o.plain
+	base := o.Plain
 	if !r.Enabled {
-		base = o.dim
+		base = o.Dim
 	}
-	mark, name, state := cell{"  ", base}, cell{r.Cluster, base}, cell{"on", o.ok}
+	mark, name, state := table.Cell{Text: "  ", Style: base}, table.Cell{Text: r.Cluster, Style: base}, table.Cell{Text: "on", Style: o.OK}
 	if r.Current {
-		mark, name.style = cell{" *", o.ok}, o.bold
+		mark, name.Style = table.Cell{Text: " *", Style: o.OK}, o.Bold
 	}
 	if !r.Enabled {
-		state = cell{"off", o.dim}
+		state = table.Cell{Text: "off", Style: o.Dim}
 	}
 	res, checked := m.checks[r.Context]
-	version := o.versionCell(r.Version, policy)
+	version := app.VersionCell(o, r.Version, policy)
 	if checked && res.Version != "" {
-		version = o.versionCell(res.Version, policy)
+		version = app.VersionCell(o, res.Version, policy)
 	}
 	if !r.Enabled {
-		version.style = o.dim
+		version.Style = o.Dim
 	}
-	var check cell
+	var check table.Cell
 	switch {
 	case m.checking[r.Context]:
-		check = cell{ansi.Strip(m.spin.View()), o.dim}
+		check = table.Cell{Text: ansi.Strip(m.spin.View()), Style: o.Dim}
 	case checked:
-		check = o.checkCell(res)
+		check = app.CheckCell(o, res)
 		if !res.CheckedAt.After(m.started) {
 			// Remembered from an earlier run: shown, but muted.
-			check.style = o.dim
+			check.Style = o.Dim
 		}
 	}
-	return row{cells: []cell{mark, name, {r.Server, base}, {r.Namespace, base}, version, state, check}}
+	return table.Row{Cells: []table.Cell{mark, name, {Text: r.Server, Style: base}, {Text: r.Namespace, Style: base}, version, state, check}}
 }
 
-// checkCell sums a result up in a word or two, worst problem first.
-func (o *output) checkCell(res checkResult) cell {
-	exp := formatExpiry(res.Expires, time.Now())
-	switch {
-	case res.Status != "ok":
-		return cell{res.Status, o.bad}
-	case res.Health == "degraded":
-		return cell{"degraded", o.bad}
-	case exp == "EXPIRED":
-		return cell{"ok, expired", o.bad}
-	case res.Nodes != nil && res.Nodes.Ready < res.Nodes.Total:
-		return cell{"ok, nodes " + res.Nodes.String(), o.warn}
-	case strings.HasSuffix(exp, "!"):
-		return cell{"ok, " + exp, o.warn}
-	}
-	return cell{"ok", o.ok}
-}
-
-func (m model) detail(o *output) string {
+func (m model) detail(o *table.Output) string {
 	it, ok := m.current()
 	if !ok {
 		return ""
@@ -708,34 +695,34 @@ func (m model) detail(o *output) string {
 				}
 			}
 		}
-		return o.paint(o.dim, fmt.Sprintf("%s: %d clusters, %d off", it.client, total, off))
+		return o.Paint(o.Dim, fmt.Sprintf("%s: %d clusters, %d off", it.client, total, off))
 	}
 	r := it.row
-	parts := []string{o.paint(o.bold, r.Context)}
+	parts := []string{o.Paint(o.Bold, r.Context)}
 	if res, ok := m.checks[r.Context]; ok {
-		c := o.checkCell(res)
-		parts = append(parts, o.paint(c.style, c.text))
-		for _, p := range res.problems(newVersionPolicy(m.checks)) {
-			parts = append(parts, o.paint(o.bad, p))
+		c := app.CheckCell(o, res)
+		parts = append(parts, o.Paint(c.Style, c.Text))
+		for _, p := range res.Problems(probe.NewVersionPolicy(m.checks)) {
+			parts = append(parts, o.Paint(o.Bad, p))
 		}
 		if res.Nodes != nil {
 			parts = append(parts, "nodes "+res.Nodes.String())
 		}
-		for _, p := range []string{res.Version, shortUser(res.User)} {
+		for _, p := range []string{res.Version, probe.ShortUser(res.User)} {
 			if p != "" {
 				parts = append(parts, p)
 			}
 		}
-		if exp := formatExpiry(res.Expires, time.Now()); exp != "" {
+		if exp := probe.FormatExpiry(res.Expires, time.Now()); exp != "" {
 			parts = append(parts, "expires "+exp)
 		}
-		parts = append(parts, o.paint(o.dim, "checked "+formatAge(time.Since(res.CheckedAt))))
+		parts = append(parts, o.Paint(o.Dim, "checked "+probe.FormatAge(time.Since(res.CheckedAt))))
 	}
-	parts = append(parts, o.paint(o.dim, r.Server))
+	parts = append(parts, o.Paint(o.Dim, r.Server))
 	return strings.Join(parts, "  ")
 }
 
-func (m model) statusLine(o *output) string {
+func (m model) statusLine(o *table.Output) string {
 	switch m.mode {
 	case modeFilter, modeRename, modeAddPath, modeAddClient:
 		return m.input.View()
@@ -751,15 +738,15 @@ func (m model) statusLine(o *output) string {
 			}
 			what = fmt.Sprintf("%s and its %d clusters", it.client, n)
 		}
-		return o.paint(o.warn, "delete "+what+"? y/N")
+		return o.Paint(o.Warn, "delete "+what+"? y/N")
 	}
 	switch {
 	case m.status != "" && m.failed:
-		return o.paint(o.bad, m.status)
+		return o.Paint(o.Bad, m.status)
 	case m.status != "":
-		return o.paint(o.ok, m.status)
+		return o.Paint(o.OK, m.status)
 	case len(m.foreign) > 0:
-		return o.paint(o.warn, fmt.Sprintf("%d unmanaged contexts, i imports them into unsorted (%s)", len(m.foreign), tildify(m.a.target)))
+		return o.Paint(o.Warn, fmt.Sprintf("%d unmanaged contexts, i imports them into unsorted (%s)", len(m.foreign), tildify(m.a.Target)))
 	}
 	return ""
 }

@@ -1,4 +1,4 @@
-package main
+package store
 
 import (
 	"fmt"
@@ -12,9 +12,9 @@ import (
 	"k8s.io/client-go/tools/clientcmd/api"
 )
 
-// readKubeconfig loads a kubeconfig from a file or stdin ("-") with relative
+// ReadKubeconfig loads a kubeconfig from a file or stdin ("-") with relative
 // file references resolved against its location.
-func readKubeconfig(path string, stdin io.Reader) (*api.Config, error) {
+func ReadKubeconfig(path string, stdin io.Reader) (*api.Config, error) {
 	var (
 		cfg    *api.Config
 		origin string
@@ -53,10 +53,10 @@ func readKubeconfig(path string, stdin io.Reader) (*api.Config, error) {
 	return cfg, nil
 }
 
-// extract returns a self-contained config holding only context ctx, with the
+// Extract returns a self-contained config holding only context ctx, with the
 // context, its cluster and its user all renamed to name. Referenced
 // certificate files are inlined so the result no longer depends on them.
-func extract(cfg *api.Config, ctx, name string) (*api.Config, error) {
+func Extract(cfg *api.Config, ctx, name string) (*api.Config, error) {
 	c, ok := cfg.Contexts[ctx]
 	if !ok {
 		return nil, fmt.Errorf("context %q not found", ctx)
@@ -85,7 +85,7 @@ func extract(cfg *api.Config, ctx, name string) (*api.Config, error) {
 	return out, nil
 }
 
-func merge(cfgs []*api.Config) *api.Config {
+func Merge(cfgs []*api.Config) *api.Config {
 	out := api.NewConfig()
 	for _, c := range cfgs {
 		for k, v := range c.Clusters {
@@ -101,7 +101,7 @@ func merge(cfgs []*api.Config) *api.Config {
 	return out
 }
 
-func contextNames(cfg *api.Config) []string {
+func ContextNames(cfg *api.Config) []string {
 	names := make([]string, 0, len(cfg.Contexts))
 	for n := range cfg.Contexts {
 		names = append(names, n)
@@ -110,7 +110,7 @@ func contextNames(cfg *api.Config) []string {
 	return names
 }
 
-func validName(s string) bool {
+func ValidName(s string) bool {
 	if s == "" || s == "." || s == ".." {
 		return false
 	}
@@ -126,9 +126,9 @@ func nameRune(r rune) bool {
 	return r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '.'
 }
 
-// sanitize derives a cluster name from an arbitrary context name. For EKS
+// Sanitize derives a cluster name from an arbitrary context name. For EKS
 // ARNs ("arn:aws:eks:...:cluster/foo") only the part after the last slash is kept.
-func sanitize(s string) string {
+func Sanitize(s string) string {
 	if i := strings.LastIndex(s, "/"); i >= 0 && i < len(s)-1 {
 		s = s[i+1:]
 	}

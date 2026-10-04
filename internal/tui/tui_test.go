@@ -1,15 +1,22 @@
-package main
+package tui
 
 import (
 	"bytes"
+	"context"
+	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/eugene-panin/kx/internal/app"
+	"github.com/eugene-panin/kx/internal/kxtest"
+	"github.com/eugene-panin/kx/internal/probe"
 	"k8s.io/client-go/tools/clientcmd"
 )
 
@@ -64,9 +71,45 @@ func typed(s string) []tea.Msg {
 	return msgs
 }
 
+// env drives App directly: the cobra layer lives in package main.
+type env struct {
+	*kxtest.Env
+	t *testing.T
+}
+
+func newEnv(t *testing.T) *env { return &env{kxtest.NewEnv(t), t} }
+
+// ok runs the few kx commands these tests need.
+func (e *env) ok(args ...string) {
+	e.t.Helper()
+	a, err := app.New(strings.NewReader(""), io.Discard, io.Discard)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	flag := func(name string) string {
+		if i := slices.Index(args, name); i >= 0 && i+1 < len(args) {
+			return args[i+1]
+		}
+		return ""
+	}
+	switch args[0] {
+	case "add":
+		err = a.Add(args[1], flag("-c"), flag("-n"), nil, false)
+	case "rm":
+		err = a.Remove(args[1:2], true)
+	case "check":
+		err = a.Check(context.Background(), nil, false, 5*time.Second, false)
+	default:
+		e.t.Fatalf("unsupported command %v", args)
+	}
+	if err != nil {
+		e.t.Fatalf("kx %v: %v", args, err)
+	}
+}
+
 func newTUI(t *testing.T, e *env, width, height int) tea.Model {
 	t.Helper()
-	a, err := newApp(strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{})
+	a, err := app.New(strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,9 +125,9 @@ func selectedRef(m tea.Model) string { return m.(model).selected() }
 
 func TestTUINavigateAndToggle(t *testing.T) {
 	e := newEnv(t)
-	e.ok("add", e.kubeconfig("a.yaml", "https://a"), "-c", "acme", "-n", "prod")
-	e.ok("add", e.kubeconfig("b.yaml", "https://b"), "-c", "acme", "-n", "stage")
-	e.ok("add", e.kubeconfig("c.yaml", "https://c"), "-c", "globex", "-n", "main")
+	e.ok("add", e.Kubeconfig("a.yaml", "https://a"), "-c", "acme", "-n", "prod")
+	e.ok("add", e.Kubeconfig("b.yaml", "https://b"), "-c", "acme", "-n", "stage")
+	e.ok("add", e.Kubeconfig("c.yaml", "https://c"), "-c", "globex", "-n", "main")
 
 	m := newTUI(t, e, 100, 20)
 	if got := selectedRef(m); got != "acme" {
@@ -94,14 +137,14 @@ func TestTUINavigateAndToggle(t *testing.T) {
 	if got := selectedRef(m); got != "acme/prod" {
 		t.Fatalf("cursor on %q after toggle, want acme/prod", got)
 	}
-	e.wantContexts("acme/stage", "globex/main")
+	e.WantContexts("acme/stage", "globex/main")
 
 	// Toggling a client header switches the whole client.
 	m = drive(t, m, keyMsg("G"), keyMsg("k"), keyMsg("space"))
 	if got := selectedRef(m); got != "globex" {
 		t.Fatalf("cursor on %q, want globex", got)
 	}
-	e.wantContexts("acme/stage")
+	e.WantContexts("acme/stage")
 	if v := ansi.Strip(m.View()); !strings.Contains(v, "globex off") || !strings.Contains(v, "off") {
 		t.Errorf("view does not show disabled state:\n%s", v)
 	}
@@ -109,8 +152,8 @@ func TestTUINavigateAndToggle(t *testing.T) {
 
 func TestTUIUse(t *testing.T) {
 	e := newEnv(t)
-	e.ok("add", e.kubeconfig("a.yaml", "https://a"), "-c", "acme", "-n", "prod")
-	e.ok("add", e.kubeconfig("b.yaml", "https://b"), "-c", "acme", "-n", "stage")
+	e.ok("add", e.Kubeconfig("a.yaml", "https://a"), "-c", "acme", "-n", "prod")
+	e.ok("add", e.Kubeconfig("b.yaml", "https://b"), "-c", "acme", "-n", "stage")
 	m := newTUI(t, e, 100, 20)
 
 	m = drive(t, m, keyMsg("enter"))
@@ -118,7 +161,7 @@ func TestTUIUse(t *testing.T) {
 		t.Errorf("enter on a client: status = %q", st)
 	}
 	m = drive(t, m, keyMsg("G"), keyMsg("enter"))
-	if cfg, _ := clientcmd.LoadFromFile(e.target); cfg.CurrentContext != "acme/stage" {
+	if cfg, _ := clientcmd.LoadFromFile(e.Target); cfg.CurrentContext != "acme/stage" {
 		t.Errorf("current-context = %q", cfg.CurrentContext)
 	}
 	if v := ansi.Strip(m.View()); !strings.Contains(v, "*  stage") {
@@ -128,8 +171,8 @@ func TestTUIUse(t *testing.T) {
 
 func TestTUIFilterRenameDelete(t *testing.T) {
 	e := newEnv(t)
-	e.ok("add", e.kubeconfig("a.yaml", "https://a"), "-c", "acme", "-n", "prod")
-	e.ok("add", e.kubeconfig("c.yaml", "https://c"), "-c", "globex", "-n", "main")
+	e.ok("add", e.Kubeconfig("a.yaml", "https://a"), "-c", "acme", "-n", "prod")
+	e.ok("add", e.Kubeconfig("c.yaml", "https://c"), "-c", "globex", "-n", "main")
 	m := newTUI(t, e, 100, 20)
 
 	m = drive(t, m, append([]tea.Msg{keyMsg("/")}, typed("glob")...)...)
@@ -143,15 +186,15 @@ func TestTUIFilterRenameDelete(t *testing.T) {
 
 	rename := append([]tea.Msg{keyMsg("r"), keyMsg("ctrl+u")}, typed("globex/prod")...)
 	m = drive(t, m, append(rename, keyMsg("enter"))...)
-	e.wantContexts("acme/prod", "globex/prod")
+	e.WantContexts("acme/prod", "globex/prod")
 	if got := selectedRef(m); got != "globex/prod" {
 		t.Errorf("cursor after rename on %q, want globex/prod", got)
 	}
 
 	m = drive(t, m, keyMsg("d"), keyMsg("n"))
-	e.wantContexts("acme/prod", "globex/prod")
+	e.WantContexts("acme/prod", "globex/prod")
 	m = drive(t, m, keyMsg("d"), keyMsg("y"))
-	e.wantContexts("acme/prod")
+	e.WantContexts("acme/prod")
 
 	m = drive(t, m, keyMsg("esc"))
 	if items := m.(model).items; len(items) != 2 {
@@ -161,7 +204,7 @@ func TestTUIFilterRenameDelete(t *testing.T) {
 
 func TestTUIAdd(t *testing.T) {
 	e := newEnv(t)
-	path := e.kubeconfig("a.yaml", "https://a")
+	path := e.Kubeconfig("a.yaml", "https://a")
 	m := newTUI(t, e, 100, 20)
 	if v := m.View(); !strings.Contains(v, "press a to add") {
 		t.Errorf("empty view has no hint:\n%s", v)
@@ -170,7 +213,7 @@ func TestTUIAdd(t *testing.T) {
 	msgs = append(msgs, keyMsg("enter"))
 	msgs = append(msgs, typed("acme")...)
 	m = drive(t, m, append(msgs, keyMsg("enter"))...)
-	e.wantContexts("acme/kubernetes-admin-kubernetes")
+	e.WantContexts("acme/kubernetes-admin-kubernetes")
 	if st := m.(model).status; !strings.Contains(st, "added acme/kubernetes-admin-kubernetes") {
 		t.Errorf("status = %q", st)
 	}
@@ -178,8 +221,8 @@ func TestTUIAdd(t *testing.T) {
 
 func TestTUIPaste(t *testing.T) {
 	e := newEnv(t)
-	e.ok("add", e.kubeconfig("a.yaml", "https://a"), "-c", "acme", "-n", "prod")
-	a, err := newApp(strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{})
+	e.ok("add", e.Kubeconfig("a.yaml", "https://a"), "-c", "acme", "-n", "prod")
+	a, err := app.New(strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -193,20 +236,20 @@ func TestTUIPaste(t *testing.T) {
 		t.Fatalf("status = %q", st)
 	}
 
-	clip = []byte(strings.Replace(strings.Replace(kubeadm, "%s", "https://new", 1), "certificate-authority: ca.crt", "insecure-skip-tls-verify: true", 1))
+	clip = []byte(strings.Replace(strings.Replace(kxtest.Kubeadm, "%s", "https://new", 1), "certificate-authority: ca.crt", "insecure-skip-tls-verify: true", 1))
 	tm = drive(t, tm, keyMsg("p"))
 	if v := tm.View(); !strings.Contains(v, "client for 1 contexts from clipboard: acme") {
 		t.Fatalf("no client prompt prefilled with the selected client:\n%s", v)
 	}
 	msgs := append([]tea.Msg{keyMsg("ctrl+u")}, typed("globex")...)
 	drive(t, tm, append(msgs, keyMsg("enter"))...)
-	e.wantContexts("acme/prod", "globex/kubernetes-admin-kubernetes")
+	e.WantContexts("acme/prod", "globex/kubernetes-admin-kubernetes")
 }
 
 func TestTUIAddDroppedFile(t *testing.T) {
 	e := newEnv(t)
-	src := e.kubeconfig("a.yaml", "https://a")
-	dropped := filepath.Join(e.src, "my config.yaml")
+	src := e.Kubeconfig("a.yaml", "https://a")
+	dropped := filepath.Join(e.Src, "my config.yaml")
 	if err := os.Rename(src, dropped); err != nil {
 		t.Fatal(err)
 	}
@@ -228,9 +271,9 @@ func TestTUIAddDroppedFile(t *testing.T) {
 
 func TestTUICheck(t *testing.T) {
 	e := newEnv(t)
-	srv := fakeAPI(t, apiOpts{})
-	writeCA(t, e, srv)
-	e.ok("add", e.kubeconfig("a.yaml", srv.URL), "-c", "acme", "-n", "prod")
+	srv := kxtest.FakeAPI(t, kxtest.APIOpts{})
+	e.WriteCA(srv)
+	e.ok("add", e.Kubeconfig("a.yaml", srv.URL), "-c", "acme", "-n", "prod")
 	m := newTUI(t, e, 120, 20)
 	m = drive(t, m, keyMsg("c"), keyMsg("j"))
 	res, ok := m.(model).checks["acme/prod"]
@@ -244,9 +287,9 @@ func TestTUICheck(t *testing.T) {
 
 func TestTUIRemembersChecks(t *testing.T) {
 	e := newEnv(t)
-	srv := fakeAPI(t, apiOpts{version: "v1.36.2", nodes: []string{"Ready"}})
-	writeCA(t, e, srv)
-	e.ok("add", e.kubeconfig("a.yaml", srv.URL), "-c", "acme", "-n", "prod")
+	srv := kxtest.FakeAPI(t, kxtest.APIOpts{Version: "v1.36.2", Nodes: []string{"Ready"}})
+	e.WriteCA(srv)
+	e.ok("add", e.Kubeconfig("a.yaml", srv.URL), "-c", "acme", "-n", "prod")
 	e.ok("check")
 	srv.Close()
 
@@ -265,7 +308,7 @@ func TestTUIRemembersChecks(t *testing.T) {
 	if res := m.(model).checks["acme/prod"]; res.Status != "unreachable" {
 		t.Fatalf("fresh result = %+v", res)
 	}
-	checks, err := (&store{dir: e.home}).loadChecks()
+	checks, err := probe.LoadCache(filepath.Join(e.Home, "checks.json"))
 	if err != nil || checks["acme/prod"].Status != "unreachable" {
 		t.Errorf("saved result = %+v, %v", checks["acme/prod"], err)
 	}
@@ -273,12 +316,12 @@ func TestTUIRemembersChecks(t *testing.T) {
 
 func TestTUIForeignContexts(t *testing.T) {
 	e := newEnv(t)
-	cfg, err := clientcmd.LoadFromFile(e.kubeconfig("a.yaml", "https://a"))
+	cfg, err := clientcmd.LoadFromFile(e.Kubeconfig("a.yaml", "https://a"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	cfg.Clusters["kubernetes"].CertificateAuthority, cfg.Clusters["kubernetes"].CertificateAuthorityData = "", []byte("CA")
-	if err := clientcmd.WriteToFile(*cfg, e.target); err != nil {
+	if err := clientcmd.WriteToFile(*cfg, e.Target); err != nil {
 		t.Fatal(err)
 	}
 	m := newTUI(t, e, 120, 20)
@@ -286,7 +329,7 @@ func TestTUIForeignContexts(t *testing.T) {
 		t.Errorf("no banner about foreign contexts:\n%s", v)
 	}
 	m = drive(t, m, keyMsg("i"))
-	e.wantContexts("unsorted/kubernetes-admin-kubernetes")
+	e.WantContexts("unsorted/kubernetes-admin-kubernetes")
 	if v := m.View(); strings.Contains(v, "unmanaged contexts") {
 		t.Errorf("banner still shown after import:\n%s", v)
 	}
@@ -294,7 +337,7 @@ func TestTUIForeignContexts(t *testing.T) {
 
 func TestTUIFitsAnyWidth(t *testing.T) {
 	e := newEnv(t)
-	e.ok("add", e.kubeconfig("a.yaml", "https://k8s.some-really-long-domain.example.com:6443"), "-c", "a-client-with-a-long-name")
+	e.ok("add", e.Kubeconfig("a.yaml", "https://k8s.some-really-long-domain.example.com:6443"), "-c", "a-client-with-a-long-name")
 	for _, w := range []int{30, 50, 80, 140} {
 		for _, h := range []int{3, 8, 30} {
 			m := newTUI(t, e, w, h)

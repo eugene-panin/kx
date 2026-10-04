@@ -1,4 +1,4 @@
-package main
+package store
 
 import (
 	"errors"
@@ -14,42 +14,45 @@ import (
 	"sigs.k8s.io/yaml"
 )
 
-// ref addresses a whole client ("acme") or one of its clusters ("acme/prod").
-type ref struct {
-	client, cluster string
+// Ref addresses a whole client ("acme") or one of its clusters ("acme/prod").
+type Ref struct {
+	Client, Cluster string
 }
 
-func (r ref) String() string {
-	if r.cluster == "" {
-		return r.client
+func (r Ref) String() string {
+	if r.Cluster == "" {
+		return r.Client
 	}
-	return r.client + "/" + r.cluster
+	return r.Client + "/" + r.Cluster
 }
 
-func parseRef(s string) (ref, error) {
+func ParseRef(s string) (Ref, error) {
 	client, cluster, _ := strings.Cut(s, "/")
-	r := ref{client: client, cluster: cluster}
-	if !validName(client) || strings.Contains(s, "/") && !validName(cluster) {
-		return ref{}, fmt.Errorf("invalid name %q: want <client> or <client>/<cluster> of [A-Za-z0-9._-]", s)
+	r := Ref{Client: client, Cluster: cluster}
+	if !ValidName(client) || strings.Contains(s, "/") && !ValidName(cluster) {
+		return Ref{}, fmt.Errorf("invalid name %q: want <client> or <client>/<cluster> of [A-Za-z0-9._-]", s)
 	}
 	return r, nil
 }
 
-type store struct {
+// Store keeps one self-contained kubeconfig per client/cluster under a directory.
+type Store struct {
 	dir string
 }
 
-func (s *store) clustersDir() string { return filepath.Join(s.dir, "clusters") }
-func (s *store) statePath() string   { return filepath.Join(s.dir, "state.yaml") }
-func (s *store) backupsDir() string  { return filepath.Join(s.dir, "backups") }
+func (s *Store) clustersDir() string { return filepath.Join(s.dir, "clusters") }
 
-func (s *store) path(r ref) string {
-	return filepath.Join(s.clustersDir(), r.client, r.cluster+".yaml")
+func (s *Store) statePath() string { return filepath.Join(s.dir, "state.yaml") }
+
+func (s *Store) BackupsDir() string { return filepath.Join(s.dir, "backups") }
+
+func (s *Store) path(r Ref) string {
+	return filepath.Join(s.clustersDir(), r.Client, r.Cluster+".yaml")
 }
 
-// clusters lists every stored cluster, sorted by client then cluster.
-func (s *store) clusters() ([]ref, error) {
-	var refs []ref
+// Clusters lists every stored cluster, sorted by client then cluster.
+func (s *Store) Clusters() ([]Ref, error) {
+	var refs []Ref
 	clients, err := os.ReadDir(s.clustersDir())
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, nil
@@ -68,28 +71,28 @@ func (s *store) clusters() ([]ref, error) {
 		for _, f := range files {
 			name, ok := strings.CutSuffix(f.Name(), ".yaml")
 			if ok && !f.IsDir() {
-				refs = append(refs, ref{client: c.Name(), cluster: name})
+				refs = append(refs, Ref{Client: c.Name(), Cluster: name})
 			}
 		}
 	}
 	return refs, nil
 }
 
-// expand resolves refs to concrete clusters; a client ref yields all its clusters.
-func (s *store) expand(args []string) ([]ref, error) {
-	all, err := s.clusters()
+// Expand resolves refs to concrete clusters; a client ref yields all its clusters.
+func (s *Store) Expand(args []string) ([]Ref, error) {
+	all, err := s.Clusters()
 	if err != nil {
 		return nil, err
 	}
-	var out []ref
+	var out []Ref
 	for _, a := range args {
-		r, err := parseRef(a)
+		r, err := ParseRef(a)
 		if err != nil {
 			return nil, err
 		}
 		found := false
 		for _, c := range all {
-			if c.client == r.client && (r.cluster == "" || c.cluster == r.cluster) {
+			if c.Client == r.Client && (r.Cluster == "" || c.Cluster == r.Cluster) {
 				found = true
 				if !slices.Contains(out, c) {
 					out = append(out, c)
@@ -103,12 +106,12 @@ func (s *store) expand(args []string) ([]ref, error) {
 	return out, nil
 }
 
-func (s *store) exists(r ref) bool {
+func (s *Store) Exists(r Ref) bool {
 	_, err := os.Stat(s.path(r))
 	return err == nil
 }
 
-func (s *store) get(r ref) (*api.Config, error) {
+func (s *Store) Get(r Ref) (*api.Config, error) {
 	cfg, err := clientcmd.LoadFromFile(s.path(r))
 	if err != nil {
 		return nil, fmt.Errorf("load %s: %w", r, err)
@@ -116,15 +119,15 @@ func (s *store) get(r ref) (*api.Config, error) {
 	return cfg, nil
 }
 
-func (s *store) put(r ref, cfg *api.Config) error {
+func (s *Store) Put(r Ref, cfg *api.Config) error {
 	data, err := clientcmd.Write(*cfg)
 	if err != nil {
 		return fmt.Errorf("encode %s: %w", r, err)
 	}
-	return writeFile(s.path(r), data)
+	return WriteFile(s.path(r), data)
 }
 
-func (s *store) remove(r ref) error {
+func (s *Store) Remove(r Ref) error {
 	if err := os.Remove(s.path(r)); err != nil {
 		return err
 	}
@@ -134,23 +137,23 @@ func (s *store) remove(r ref) error {
 	return nil
 }
 
-// move renames a cluster, rewriting the context/cluster/user names inside.
-func (s *store) move(from, to ref) error {
-	cfg, err := s.get(from)
+// Move renames a cluster, rewriting the context/cluster/user names inside.
+func (s *Store) Move(from, to Ref) error {
+	cfg, err := s.Get(from)
 	if err != nil {
 		return err
 	}
-	moved, err := extract(cfg, from.String(), to.String())
+	moved, err := Extract(cfg, from.String(), to.String())
 	if err != nil {
 		return fmt.Errorf("%s: %w", from, err)
 	}
-	if err := s.put(to, moved); err != nil {
+	if err := s.Put(to, moved); err != nil {
 		return err
 	}
-	return s.remove(from)
+	return s.Remove(from)
 }
 
-type state struct {
+type State struct {
 	// Disabled holds client and client/cluster refs excluded from the build.
 	Disabled []string `json:"disabled,omitempty"`
 	// Generated lists the contexts written by the last build; anything else
@@ -158,8 +161,8 @@ type state struct {
 	Generated []string `json:"generated,omitempty"`
 }
 
-func (s *store) loadState() (*state, error) {
-	st := &state{}
+func (s *Store) LoadState() (*State, error) {
+	st := &State{}
 	data, err := os.ReadFile(s.statePath())
 	if errors.Is(err, fs.ErrNotExist) {
 		return st, nil
@@ -173,60 +176,60 @@ func (s *store) loadState() (*state, error) {
 	return st, nil
 }
 
-func (s *store) saveState(st *state) error {
+func (s *Store) SaveState(st *State) error {
 	slices.Sort(st.Disabled)
 	st.Disabled = slices.Compact(st.Disabled)
 	data, err := yaml.Marshal(st)
 	if err != nil {
 		return err
 	}
-	return writeFile(s.statePath(), data)
+	return WriteFile(s.statePath(), data)
 }
 
-func (st *state) enabled(r ref) bool {
-	return !slices.Contains(st.Disabled, r.client) && !slices.Contains(st.Disabled, r.String())
+func (st *State) Enabled(r Ref) bool {
+	return !slices.Contains(st.Disabled, r.Client) && !slices.Contains(st.Disabled, r.String())
 }
 
-// forget drops every disabled entry that refers to r or, for a client, to its clusters.
-func (st *state) forget(r ref) {
+// Forget drops every disabled entry that refers to r or, for a client, to its clusters.
+func (st *State) Forget(r Ref) {
 	st.Disabled = slices.DeleteFunc(st.Disabled, func(d string) bool {
-		return d == r.String() || r.cluster == "" && strings.HasPrefix(d, r.client+"/")
+		return d == r.String() || r.Cluster == "" && strings.HasPrefix(d, r.Client+"/")
 	})
 }
 
-func (st *state) disable(r ref) {
-	if r.cluster == "" {
-		st.forget(r)
-	} else if slices.Contains(st.Disabled, r.client) {
+func (st *State) Disable(r Ref) {
+	if r.Cluster == "" {
+		st.Forget(r)
+	} else if slices.Contains(st.Disabled, r.Client) {
 		return
 	}
 	st.Disabled = append(st.Disabled, r.String())
 }
 
-// enable turns r on. Enabling one cluster of a disabled client keeps its
+// Enable turns r on. Enabling one cluster of a disabled client keeps its
 // siblings off, so the client entry is replaced with per-cluster entries.
-func (st *state) enable(r ref, siblings []ref) {
-	if r.cluster != "" && slices.Contains(st.Disabled, r.client) {
-		st.forget(ref{client: r.client})
+func (st *State) Enable(r Ref, siblings []Ref) {
+	if r.Cluster != "" && slices.Contains(st.Disabled, r.Client) {
+		st.Forget(Ref{Client: r.Client})
 		for _, s := range siblings {
-			if s.client == r.client && s != r {
+			if s.Client == r.Client && s != r {
 				st.Disabled = append(st.Disabled, s.String())
 			}
 		}
 		return
 	}
-	st.forget(r)
+	st.Forget(r)
 }
 
-// prune drops disabled entries pointing at clients or clusters that no longer exist.
-func (st *state) prune(refs []ref) {
+// Prune drops disabled entries pointing at clients or clusters that no longer exist.
+func (st *State) Prune(refs []Ref) {
 	st.Disabled = slices.DeleteFunc(st.Disabled, func(d string) bool {
-		return !slices.ContainsFunc(refs, func(r ref) bool { return d == r.client || d == r.String() })
+		return !slices.ContainsFunc(refs, func(r Ref) bool { return d == r.Client || d == r.String() })
 	})
 }
 
-// writeFile replaces path atomically so Lens/k9s never read a half-written file.
-func writeFile(path string, data []byte) (err error) {
+// WriteFile replaces path atomically so Lens/k9s never read a half-written file.
+func WriteFile(path string, data []byte) (err error) {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
@@ -253,3 +256,7 @@ func writeFile(path string, data []byte) (err error) {
 	}
 	return os.Rename(f.Name(), path)
 }
+
+func New(dir string) *Store { return &Store{dir: dir} }
+
+func (s *Store) Dir() string { return s.dir }

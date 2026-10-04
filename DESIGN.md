@@ -137,7 +137,7 @@ bubbletea. В pipe `kx` без аргументов печатает help.
 
 ## Агенты
 
-Агенту не нужен весь зоопарк: `kx exec acme -- claude` — и он видит только
+Агенту не нужен весь зоопарк: `kx exec acme -- <агент>` — и он видит только
 кластеры `acme`, промахнуться в прод другого заказчика нельзя. Это защита от
 ошибок, а не песочница: `~/.kube/config` и хранилище остаются читаемыми.
 
@@ -152,6 +152,21 @@ MCP-сервер пока не делаем. Если появится — бе�
 
 - `KX_HOME` — хранилище (по умолчанию `$XDG_CONFIG_HOME/kx` или `~/.config/kx`).
 - `KX_KUBECONFIG` — куда собирать (по умолчанию `~/.kube/config`).
+
+## Код
+
+```
+main.go              cobra: разбор команд и флагов, автодополнение
+internal/app/        команды kx (add, on/off, rm, mv, use, export, exec, check, build) — общие для CLI и TUI
+internal/store/      хранилище: кластеры, state.yaml, разбор/слияние kubeconfig, атомарная запись
+internal/probe/      проверка кластера: version, whoami, readyz, ноды, сроки кредов, политика версий, кэш
+internal/table/      таблицы: цвет, подгонка под ширину
+internal/tui/        интерактивный режим
+internal/kxtest/     фикстуры для тестов: окружение, kubeconfig, фейковый API-сервер
+```
+
+`main.go` лежит в корне, чтобы `go install github.com/eugene-panin/kx@latest`
+давал бинарник `kx`. E2E-тесты CLI — в `main_test.go`, остальные — рядом с пакетами.
 
 ## Стек
 

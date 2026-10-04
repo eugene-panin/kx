@@ -1,6 +1,6 @@
-module kx
+module github.com/eugene-panin/kx
 
-go 1.26.5
+go 1.26.0
 
 require (
 	github.com/charmbracelet/bubbles v1.0.0

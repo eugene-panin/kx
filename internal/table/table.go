@@ -1,4 +1,4 @@
-package main
+package table
 
 import (
 	"io"
@@ -12,123 +12,123 @@ import (
 
 const colGap = 2
 
-// output renders tables for a terminal: colored and fitted to its width. For
+// Output renders tables for a terminal: colored and fitted to its width. For
 // pipes it degrades to plain, untruncated text that scripts can rely on.
-type output struct {
-	w     io.Writer
-	tty   bool
-	color bool
-	width int // 0 means unlimited
+type Output struct {
+	W     io.Writer
+	TTY   bool
+	Color bool
+	Width int // 0 means unlimited
 
-	plain, ok, bad, warn, dim, bold, title, header, sel lipgloss.Style
+	Plain, OK, Bad, Warn, Dim, Bold, Title, Header, Sel lipgloss.Style
 }
 
-func newOutput(w io.Writer) *output {
-	o := &output{w: w}
-	if isTerminal(w) {
+func New(w io.Writer) *Output {
+	o := &Output{W: w}
+	if IsTerminal(w) {
 		f := w.(*os.File)
-		o.tty = true
+		o.TTY = true
 		if width, _, err := term.GetSize(f.Fd()); err == nil {
-			o.width = width
+			o.Width = width
 		}
-		o.color = os.Getenv("NO_COLOR") == "" && os.Getenv("TERM") != "dumb"
+		o.Color = os.Getenv("NO_COLOR") == "" && os.Getenv("TERM") != "dumb"
 	}
 	r := lipgloss.NewRenderer(w)
 	// Basic ANSI colors follow the user's terminal theme.
-	o.plain = r.NewStyle()
-	o.ok = r.NewStyle().Foreground(lipgloss.Color("2"))
-	o.bad = r.NewStyle().Foreground(lipgloss.Color("1"))
-	o.warn = r.NewStyle().Foreground(lipgloss.Color("3"))
-	o.dim = r.NewStyle().Faint(true)
-	o.bold = r.NewStyle().Bold(true)
-	o.title = r.NewStyle().Bold(true).Foreground(lipgloss.Color("4"))
-	o.header = r.NewStyle().Faint(true)
-	o.sel = r.NewStyle().Reverse(true)
+	o.Plain = r.NewStyle()
+	o.OK = r.NewStyle().Foreground(lipgloss.Color("2"))
+	o.Bad = r.NewStyle().Foreground(lipgloss.Color("1"))
+	o.Warn = r.NewStyle().Foreground(lipgloss.Color("3"))
+	o.Dim = r.NewStyle().Faint(true)
+	o.Bold = r.NewStyle().Bold(true)
+	o.Title = r.NewStyle().Bold(true).Foreground(lipgloss.Color("4"))
+	o.Header = r.NewStyle().Faint(true)
+	o.Sel = r.NewStyle().Reverse(true)
 	return o
 }
 
-func isTerminal(v any) bool {
+func IsTerminal(v any) bool {
 	f, ok := v.(*os.File)
 	return ok && term.IsTerminal(f.Fd())
 }
 
-func (o *output) paint(st lipgloss.Style, s string) string {
-	if !o.color || s == "" {
+func (o *Output) Paint(st lipgloss.Style, s string) string {
+	if !o.Color || s == "" {
 		return s
 	}
 	return st.Render(s)
 }
 
-type column struct {
-	title  string
-	shrink int  // narrowest width when truncating with "…"; 0 never truncates
-	trim   bool // secondary value: may lose up to a third before columns are hidden
-	drop   int  // order in which columns are hidden when too wide, 1 first; 0 never
+type Column struct {
+	Title  string
+	Shrink int  // narrowest width when truncating with "…"; 0 never truncates
+	Trim   bool // secondary value: may lose up to a third before columns are hidden
+	Drop   int  // order in which columns are hidden when too wide, 1 first; 0 never
 }
 
-type cell struct {
-	text  string
-	style lipgloss.Style
+type Cell struct {
+	Text  string
+	Style lipgloss.Style
 }
 
-// row is either a list of cells or a full-width title (e.g. a client name)
+// Row is either a list of cells or a full-width title (e.g. a client name)
 // that does not take part in column sizing.
-type row struct {
-	cells []cell
-	title string
+type Row struct {
+	Cells []Cell
+	Title string
 }
 
-func (o *output) table(cols []column, rows []row) error {
-	lines := o.render(cols, rows)
-	_, err := io.WriteString(o.w, strings.Join(lines, "\n")+"\n")
+func (o *Output) Table(cols []Column, rows []Row) error {
+	lines := o.Render(cols, rows)
+	_, err := io.WriteString(o.W, strings.Join(lines, "\n")+"\n")
 	return err
 }
 
-// render lays rows out to the output width. The first line is the column
+// Render lays rows out to the output width. The first line is the column
 // header; the rest map one to one onto rows.
-func (o *output) render(cols []column, rows []row) []string {
+func (o *Output) Render(cols []Column, rows []Row) []string {
 	nat := make([]int, len(cols))
 	for i, c := range cols {
-		nat[i] = ansi.StringWidth(c.title)
+		nat[i] = ansi.StringWidth(c.Title)
 	}
 	for _, r := range rows {
-		for i, c := range r.cells {
-			nat[i] = max(nat[i], ansi.StringWidth(c.text))
+		for i, c := range r.Cells {
+			nat[i] = max(nat[i], ansi.StringWidth(c.Text))
 		}
 	}
-	show, widths := fit(cols, nat, o.width)
+	show, widths := fit(cols, nat, o.Width)
 
-	line := func(cells []cell) string {
+	line := func(cells []Cell) string {
 		var parts []string
 		for i, c := range cells {
 			if !show[i] {
 				continue
 			}
-			text := ansi.Truncate(c.text, widths[i], "…")
+			text := ansi.Truncate(c.Text, widths[i], "…")
 			pad := strings.Repeat(" ", widths[i]-ansi.StringWidth(text))
-			parts = append(parts, o.paint(c.style, text)+pad)
+			parts = append(parts, o.Paint(c.Style, text)+pad)
 		}
 		l := strings.TrimRight(strings.Join(parts, strings.Repeat(" ", colGap)), " ")
-		if o.width > 0 {
+		if o.Width > 0 {
 			// Even the minimum widths may not fit a very narrow window.
-			l = ansi.Truncate(l, o.width-1, "…")
+			l = ansi.Truncate(l, o.Width-1, "…")
 		}
 		return l
 	}
-	header := make([]cell, len(cols))
+	header := make([]Cell, len(cols))
 	for i, c := range cols {
-		header[i] = cell{c.title, o.header}
+		header[i] = Cell{Text: c.Title, Style: o.Header}
 	}
 	lines := []string{line(header)}
 	for _, r := range rows {
-		if r.cells == nil {
-			if o.width > 0 {
-				r.title = ansi.Truncate(r.title, o.width-1, "…")
+		if r.Cells == nil {
+			if o.Width > 0 {
+				r.Title = ansi.Truncate(r.Title, o.Width-1, "…")
 			}
-			lines = append(lines, r.title)
+			lines = append(lines, r.Title)
 			continue
 		}
-		lines = append(lines, line(r.cells))
+		lines = append(lines, line(r.Cells))
 	}
 	return lines
 }
@@ -136,7 +136,7 @@ func (o *output) render(cols []column, rows []row) []string {
 // fit decides which columns to show and how wide, so that a row fits limit:
 // first trim secondary values by up to a third, then hide secondary columns
 // (in drop order), and only then truncate down to the hard minimums.
-func fit(cols []column, nat []int, limit int) (show []bool, widths []int) {
+func fit(cols []Column, nat []int, limit int) (show []bool, widths []int) {
 	show = make([]bool, len(cols))
 	for i := range show {
 		show[i] = true
@@ -149,11 +149,11 @@ func fit(cols []column, nat []int, limit int) (show []bool, widths []int) {
 	hard := make([]int, len(cols))
 	for i, c := range cols {
 		hard[i] = nat[i]
-		if c.shrink > 0 {
-			hard[i] = min(nat[i], c.shrink)
+		if c.Shrink > 0 {
+			hard[i] = min(nat[i], c.Shrink)
 		}
 		soft[i] = nat[i]
-		if c.trim {
+		if c.Trim {
 			soft[i] = max(hard[i], nat[i]*2/3)
 		}
 	}
@@ -178,7 +178,7 @@ func fit(cols []column, nat []int, limit int) (show []bool, widths []int) {
 		}
 		next := -1
 		for i, c := range cols {
-			if show[i] && c.drop > 0 && (next < 0 || c.drop < cols[next].drop) {
+			if show[i] && c.Drop > 0 && (next < 0 || c.Drop < cols[next].Drop) {
 				next = i
 			}
 		}
@@ -206,10 +206,10 @@ func shrink(show []bool, widths, mins []int, excess int) {
 	}
 }
 
-// wrapIndented word-wraps s to the output width with every line indented.
-func (o *output) wrapIndented(s, indent string) string {
-	if o.width > len(indent)+10 {
-		s = ansi.Wrap(s, o.width-1-len(indent), " ")
+// WrapIndented word-wraps s to the output width with every line indented.
+func (o *Output) WrapIndented(s, indent string) string {
+	if o.Width > len(indent)+10 {
+		s = ansi.Wrap(s, o.Width-1-len(indent), " ")
 	}
 	return indent + strings.ReplaceAll(s, "\n", "\n"+indent)
 }

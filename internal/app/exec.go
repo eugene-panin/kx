@@ -1,4 +1,4 @@
-package main
+package app
 
 import (
 	"errors"
@@ -9,27 +9,28 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/eugene-panin/kx/internal/store"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/clientcmd/api"
 )
 
-// exitError carries a child's exit status up to main without an error message.
-type exitError int
+// ExitError carries a child's exit status up to main without an error message.
+type ExitError int
 
-func (e exitError) Error() string { return fmt.Sprintf("exit status %d", int(e)) }
+func (e ExitError) Error() string { return fmt.Sprintf("exit status %d", int(e)) }
 
 // bundle merges the given clusters into one kubeconfig with the first one as
 // current-context. Namespaces switched in the target since the last change win.
-func (a *app) bundle(refs []ref) (*api.Config, error) {
+func (a *App) bundle(refs []store.Ref) (*api.Config, error) {
 	parts := make([]*api.Config, 0, len(refs))
 	for _, r := range refs {
-		cfg, err := a.store.get(r)
+		cfg, err := a.Store.Get(r)
 		if err != nil {
 			return nil, err
 		}
 		parts = append(parts, cfg)
 	}
-	out := merge(parts)
+	out := store.Merge(parts)
 	out.CurrentContext = refs[0].String()
 	if cur, err := a.loadTarget(); err == nil {
 		for name, ctx := range out.Contexts {
@@ -41,10 +42,10 @@ func (a *app) bundle(refs []ref) (*api.Config, error) {
 	return out, nil
 }
 
-// scope writes a temporary kubeconfig holding only the given clusters,
+// Scope writes a temporary kubeconfig holding only the given clusters,
 // disabled ones included. The caller must call cleanup when done with it.
-func (a *app) scope(args []string) (path string, cleanup func(), err error) {
-	refs, err := a.store.expand(args)
+func (a *App) Scope(args []string) (path string, cleanup func(), err error) {
+	refs, err := a.Store.Expand(args)
 	if err != nil {
 		return "", nil, err
 	}
@@ -73,22 +74,22 @@ func (a *app) scope(args []string) (path string, cleanup func(), err error) {
 	return f.Name(), cleanup, nil
 }
 
-func scopeEnv(path string, args []string) []string {
+func ScopeEnv(path string, args []string) []string {
 	return append(os.Environ(), "KUBECONFIG="+path, "KX_SCOPE="+strings.Join(args, ","))
 }
 
-// exec runs command with KUBECONFIG pointing at a temporary kubeconfig that
+// Exec runs command with KUBECONFIG pointing at a temporary kubeconfig that
 // holds only the given clusters, disabled ones included.
-func (a *app) exec(args, command []string) error {
-	path, cleanup, err := a.scope(args)
+func (a *App) Exec(args, command []string) error {
+	path, cleanup, err := a.Scope(args)
 	if err != nil {
 		return err
 	}
 	defer cleanup()
 
 	cmd := exec.Command(command[0], command[1:]...)
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = a.stdin, a.stdout, a.stderr
-	cmd.Env = scopeEnv(path, args)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = a.Stdin, a.Stdout, a.Stderr
+	cmd.Env = ScopeEnv(path, args)
 	if err := cmd.Start(); err != nil {
 		return err
 	}
@@ -124,7 +125,7 @@ func (a *app) exec(args, command []string) error {
 		if code < 0 {
 			code = 1
 		}
-		return exitError(code)
+		return ExitError(code)
 	}
 	return err
 }

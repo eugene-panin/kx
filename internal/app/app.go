@@ -1,4 +1,4 @@
-package main
+package app
 
 import (
 	"bytes"
@@ -12,50 +12,80 @@ import (
 	"strings"
 	"time"
 
+	"github.com/eugene-panin/kx/internal/store"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/clientcmd/api"
 )
 
-const keepBackups = 10
-
-type app struct {
-	store  *store
-	target string
-	stdin  io.Reader
-	stdout io.Writer
-	stderr io.Writer
+// New reads KX_HOME and KX_KUBECONFIG and returns an App for them.
+func New(stdin io.Reader, stdout, stderr io.Writer) (*App, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, err
+	}
+	dir := os.Getenv("KX_HOME")
+	if dir == "" {
+		base := os.Getenv("XDG_CONFIG_HOME")
+		if base == "" {
+			base = filepath.Join(home, ".config")
+		}
+		dir = filepath.Join(base, "kx")
+	}
+	target := os.Getenv("KX_KUBECONFIG")
+	if target == "" {
+		target = filepath.Join(home, ".kube", "config")
+	}
+	if target, err = filepath.Abs(target); err != nil {
+		return nil, err
+	}
+	// Write through a symlinked kubeconfig instead of replacing the link.
+	if resolved, err := filepath.EvalSymlinks(target); err == nil {
+		target = resolved
+	}
+	return &App{Store: store.New(dir), Target: target, Stdin: stdin, Stdout: stdout, Stderr: stderr}, nil
 }
 
-func (a *app) loadTarget() (*api.Config, error) {
-	cfg, err := clientcmd.LoadFromFile(a.target)
+const keepBackups = 10
+
+// App carries out kx commands. The CLI and the interactive mode share it.
+type App struct {
+	Store  *store.Store
+	Target string // the kubeconfig kx builds
+	Stdin  io.Reader
+	Stdout io.Writer
+	Stderr io.Writer
+}
+
+func (a *App) loadTarget() (*api.Config, error) {
+	cfg, err := clientcmd.LoadFromFile(a.Target)
 	if errors.Is(err, fs.ErrNotExist) {
 		return api.NewConfig(), nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("load %s: %w", a.target, err)
+		return nil, fmt.Errorf("load %s: %w", a.Target, err)
 	}
 	return cfg, nil
 }
 
-// unmanaged returns contexts in the target kubeconfig that kx neither stores
+// Unmanaged returns contexts in the target kubeconfig that kx neither stores
 // nor generated last time: a rebuild would silently drop them.
-func (a *app) unmanaged() ([]string, error) {
+func (a *App) Unmanaged() ([]string, error) {
 	cur, err := a.loadTarget()
 	if err != nil {
 		return nil, err
 	}
-	refs, err := a.store.clusters()
+	refs, err := a.Store.Clusters()
 	if err != nil {
 		return nil, err
 	}
-	st, err := a.store.loadState()
+	st, err := a.Store.LoadState()
 	if err != nil {
 		return nil, err
 	}
 	var out []string
-	for _, name := range contextNames(cur) {
+	for _, name := range store.ContextNames(cur) {
 		known := slices.Contains(st.Generated, name) ||
-			slices.ContainsFunc(refs, func(r ref) bool { return r.String() == name })
+			slices.ContainsFunc(refs, func(r store.Ref) bool { return r.String() == name })
 		if !known {
 			out = append(out, name)
 		}
@@ -64,8 +94,8 @@ func (a *app) unmanaged() ([]string, error) {
 }
 
 // checkTarget refuses to proceed while the target holds contexts kx would lose.
-func (a *app) checkTarget() error {
-	names, err := a.unmanaged()
+func (a *App) checkTarget() error {
+	names, err := a.Unmanaged()
 	if err != nil {
 		return err
 	}
@@ -74,12 +104,12 @@ func (a *app) checkTarget() error {
 	}
 	return fmt.Errorf("%s has contexts not managed by kx:\n  %s\n"+
 		"take them over with `kx import-current -c <client>` or drop them with `kx build --force`",
-		a.target, strings.Join(names, "\n  "))
+		a.Target, strings.Join(names, "\n  "))
 }
 
 // prepare runs before any change: it refuses to touch a target holding foreign
 // contexts and pulls namespace switches made by other tools into the store.
-func (a *app) prepare() error {
+func (a *App) prepare() error {
 	if err := a.checkTarget(); err != nil {
 		return err
 	}
@@ -89,12 +119,12 @@ func (a *app) prepare() error {
 // syncNamespaces copies namespaces switched in the target (k9s, kubens,
 // kubectl config set-context) back into the store, so a rebuild keeps them
 // and they survive off/on.
-func (a *app) syncNamespaces() error {
+func (a *App) syncNamespaces() error {
 	cur, err := a.loadTarget()
 	if err != nil {
 		return err
 	}
-	refs, err := a.store.clusters()
+	refs, err := a.Store.Clusters()
 	if err != nil {
 		return err
 	}
@@ -103,7 +133,7 @@ func (a *app) syncNamespaces() error {
 		if tc == nil {
 			continue
 		}
-		cfg, err := a.store.get(r)
+		cfg, err := a.Store.Get(r)
 		if err != nil {
 			return err
 		}
@@ -112,26 +142,26 @@ func (a *app) syncNamespaces() error {
 			continue
 		}
 		sc.Namespace = tc.Namespace
-		if err := a.store.put(r, cfg); err != nil {
+		if err := a.Store.Put(r, cfg); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// build regenerates the target. renames maps old context names to new ones so
+// Build regenerates the target. renames maps old context names to new ones so
 // that a renamed current-context survives.
-func (a *app) build(force bool, renames map[string]string) error {
+func (a *App) Build(force bool, renames map[string]string) error {
 	if !force {
 		if err := a.checkTarget(); err != nil {
 			return err
 		}
 	}
-	refs, err := a.store.clusters()
+	refs, err := a.Store.Clusters()
 	if err != nil {
 		return err
 	}
-	st, err := a.store.loadState()
+	st, err := a.Store.LoadState()
 	if err != nil {
 		return err
 	}
@@ -140,17 +170,17 @@ func (a *app) build(force bool, renames map[string]string) error {
 		names []string
 	)
 	for _, r := range refs {
-		if !st.enabled(r) {
+		if !st.Enabled(r) {
 			continue
 		}
-		cfg, err := a.store.get(r)
+		cfg, err := a.Store.Get(r)
 		if err != nil {
 			return err
 		}
 		parts = append(parts, cfg)
-		names = append(names, contextNames(cfg)...)
+		names = append(names, store.ContextNames(cfg)...)
 	}
-	out := merge(parts)
+	out := store.Merge(parts)
 	// A broken target is only possible with --force; it just loses current-context then.
 	if cur, err := a.loadTarget(); err == nil {
 		name := cur.CurrentContext
@@ -165,29 +195,29 @@ func (a *app) build(force bool, renames map[string]string) error {
 	if err != nil {
 		return err
 	}
-	old, err := os.ReadFile(a.target)
+	old, err := os.ReadFile(a.Target)
 	switch {
 	case err == nil && bytes.Equal(old, data):
 	case err == nil:
 		if err := a.backup(old); err != nil {
-			return fmt.Errorf("backup %s: %w", a.target, err)
+			return fmt.Errorf("backup %s: %w", a.Target, err)
 		}
 		fallthrough
 	case errors.Is(err, fs.ErrNotExist):
-		if err := writeFile(a.target, data); err != nil {
+		if err := store.WriteFile(a.Target, data); err != nil {
 			return err
 		}
 	default:
 		return err
 	}
 	st.Generated = names
-	return a.store.saveState(st)
+	return a.Store.SaveState(st)
 }
 
-func (a *app) backup(data []byte) error {
-	dir := a.store.backupsDir()
+func (a *App) backup(data []byte) error {
+	dir := a.Store.BackupsDir()
 	name := "config-" + time.Now().Format("20060102-150405.000000")
-	if err := writeFile(filepath.Join(dir, name), data); err != nil {
+	if err := store.WriteFile(filepath.Join(dir, name), data); err != nil {
 		return err
 	}
 	entries, err := os.ReadDir(dir)
@@ -208,4 +238,13 @@ func (a *app) backup(data []byte) error {
 		backups = backups[1:]
 	}
 	return nil
+}
+
+// Rebuild is `kx build`: pull namespace switches in and regenerate the target.
+// With force the target may be unreadable, so namespaces are best effort then.
+func (a *App) Rebuild(force bool) error {
+	if err := a.syncNamespaces(); err != nil && !force {
+		return err
+	}
+	return a.Build(force, nil)
 }
