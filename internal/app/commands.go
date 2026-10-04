@@ -21,7 +21,7 @@ import (
 // anything is written.
 func (a *App) Add(src, client, name string, contexts []string, force bool) ([]store.Ref, error) {
 	if !store.ValidName(client) {
-		return nil, fmt.Errorf("invalid client name %q", client)
+		return nil, fmt.Errorf("%w: client %q, want [A-Za-z0-9._-]", store.ErrInvalidName, client)
 	}
 	if src != "-" {
 		// a.Target has its symlinks resolved; resolve src the same way, or a
@@ -40,12 +40,21 @@ func (a *App) Add(src, client, name string, contexts []string, force bool) ([]st
 		return nil, err
 	}
 	if src == "-" && table.IsTerminal(a.Stdin) {
+		if a.NoInput {
+			return nil, &UsageError{Err: errors.New("--no-input: nothing to read, stdin is a terminal"), Hint: "pipe the kubeconfig in: kx add - -c <client> < file"}
+		}
 		fmt.Fprintln(a.Stderr, "Paste the kubeconfig, then press Ctrl-D (Ctrl-C to cancel).")
 	}
 	cfg, err := store.ReadKubeconfig(src, a.Stdin)
 	if err != nil {
 		return nil, err
 	}
+	// Not before the paste: another kx would wait while the user copies.
+	unlock, err := a.lock()
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	if len(contexts) == 0 {
 		contexts = store.ContextNames(cfg)
 	}
@@ -68,7 +77,7 @@ func (a *App) Add(src, client, name string, contexts []string, force bool) ([]st
 			cluster = store.Sanitize(ctx)
 		}
 		if !store.ValidName(cluster) {
-			return nil, fmt.Errorf("invalid cluster name %q", cluster)
+			return nil, fmt.Errorf("%w: cluster %q, want [A-Za-z0-9._-]", store.ErrInvalidName, cluster)
 		}
 		r := store.Ref{Client: client, Cluster: cluster}
 		if prev, dup := seen[r]; dup {
@@ -87,30 +96,55 @@ func (a *App) Add(src, client, name string, contexts []string, force bool) ([]st
 		}
 		items = append(items, item{r, one})
 	}
-	var added []store.Ref
+	st, err := a.Store.LoadState()
+	if err != nil {
+		return nil, err
+	}
+	var added, off []store.Ref
 	for _, it := range items {
+		verb := "added"
+		if old, err := a.Store.Get(it.r); err == nil {
+			verb = "replaced"
+			// A namespace set with kx ns outlives the new credentials unless
+			// the new kubeconfig picks one itself.
+			name := it.r.String()
+			if oc, nc := old.Contexts[name], it.cfg.Contexts[name]; oc != nil && nc != nil && nc.Namespace == "" {
+				nc.Namespace = oc.Namespace
+			}
+		}
 		if err := a.Store.Put(it.r, it.cfg); err != nil {
 			return added, err
 		}
 		added = append(added, it.r)
-		a.say("added %s  %s", it.r, it.cfg.Clusters[it.r.String()].Server)
+		if !st.Enabled(it.r) {
+			off = append(off, it.r)
+		}
+		a.say("%s %s  %s", verb, it.r, it.cfg.Clusters[it.r.String()].Server)
 	}
-	return added, a.Build(false, nil)
+	if err := a.build(false, nil); err != nil {
+		return added, err
+	}
+	for _, r := range off {
+		a.say("%s stays off (kx on %s turns it on)", r, r)
+	}
+	return added, nil
 }
 
 func (a *App) ImportCurrent(client string) error {
 	if !store.ValidName(client) {
-		return fmt.Errorf("invalid client name %q", client)
+		return fmt.Errorf("%w: client %q, want [A-Za-z0-9._-]", store.ErrInvalidName, client)
 	}
-	if err := a.SyncAndReport(); err != nil {
+	unlock, err := a.lock()
+	if err != nil {
 		return err
 	}
+	defer unlock()
 	names, err := a.Unmanaged()
 	if err != nil {
 		return err
 	}
 	if len(names) == 0 {
-		fmt.Fprintln(a.Stdout, "nothing to import")
+		a.say("nothing to import")
 		return nil
 	}
 	cfg, err := store.ReadKubeconfig(a.Target, nil)
@@ -144,7 +178,7 @@ func (a *App) ImportCurrent(client string) error {
 	if err := a.Store.SaveState(st); err != nil {
 		return err
 	}
-	return a.Build(false, renames)
+	return a.build(false, renames)
 }
 
 type ListRow struct {
@@ -233,10 +267,11 @@ func (a *App) List(client string, asJSON bool) error {
 	o := a.Output(a.Stdout)
 	if !o.TTY {
 		// One line per cluster with the client on it, so grep keeps working.
-		cols := []table.Column{{}, {Title: "CLIENT"}, {Title: "CLUSTER"}, {Title: "SERVER"}, {Title: "NAMESPACE"}, {Title: "VERSION"}, {Title: "STATE"}}
+		cols := []table.Column{{Title: "CURRENT"}, {Title: "CLIENT"}, {Title: "CLUSTER"}, {Title: "SERVER"}, {Title: "NAMESPACE"}, {Title: "VERSION"}, {Title: "STATE"}}
 		var out []table.Row
 		for _, r := range rows {
-			mark, state := " ", "on"
+			// "-" rather than blank, or awk's fields shift on the current row.
+			mark, state := "-", "on"
 			if r.Current {
 				mark = "*"
 			}
@@ -296,21 +331,26 @@ func (a *App) Toggle(args []string, on bool) error {
 	if err := a.prepare(); err != nil {
 		return err
 	}
+	unlock, err := a.lock()
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	all, err := a.Store.Clusters()
+	if err != nil {
+		return err
+	}
+	// Check every argument before changing anything, so one typo at the end
+	// doesn't leave half the request applied and reported as done.
+	if _, err := a.Store.Expand(args); err != nil {
+		return err
+	}
+	before, err := a.Store.LoadState()
 	if err != nil {
 		return err
 	}
 	st, err := a.Store.LoadState()
 	if err != nil {
-		return err
-	}
-	word := "off"
-	if on {
-		word = "on"
-	}
-	// Check every argument before changing anything, so one typo at the end
-	// doesn't leave half the request applied and reported as done.
-	if _, err := a.Store.Expand(args); err != nil {
 		return err
 	}
 	refs := make([]store.Ref, len(args))
@@ -325,13 +365,44 @@ func (a *App) Toggle(args []string, on bool) error {
 	if err := a.Store.SaveState(st); err != nil {
 		return err
 	}
-	if err := a.Build(false, nil); err != nil {
+	if err := a.build(false, nil); err != nil {
+		// The target didn't change, so neither should the state: otherwise
+		// the next build would quietly finish this one.
+		if rerr := a.Store.SaveState(before); rerr != nil {
+			err = errors.Join(err, rerr)
+		}
 		return err
 	}
 	for _, r := range refs {
-		a.say("%s: %s", r, word)
+		a.say("%s", toggled(r, on, all, st))
 	}
 	return nil
+}
+
+// toggled says what kx on/off did to r. For a client it counts the clusters
+// and names the ones left off, which a client entry alone doesn't show.
+func toggled(r store.Ref, on bool, all []store.Ref, st *store.State) string {
+	word := "off"
+	if on {
+		word = "on"
+	}
+	if r.Cluster != "" {
+		return r.String() + ": " + word
+	}
+	var mine, off []string
+	for _, c := range all {
+		if c.Client != r.Client {
+			continue
+		}
+		mine = append(mine, c.Cluster)
+		if !st.Enabled(c) {
+			off = append(off, c.Cluster)
+		}
+	}
+	if !on || len(off) == 0 {
+		return fmt.Sprintf("%s: %s (%s)", r, word, plural(len(mine), "cluster"))
+	}
+	return fmt.Sprintf("%s: on, %d of %d clusters; still off: %s", r, len(mine)-len(off), len(mine), strings.Join(off, ", "))
 }
 
 // Remove deletes clusters from the store. dryRun lists them and changes
@@ -365,6 +436,12 @@ func (a *App) Remove(args []string, yes, dryRun bool) error {
 			return err
 		}
 	}
+	// Not before the question: another kx would wait for the answer.
+	unlock, err := a.lock()
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	for _, r := range refs {
 		if err := a.Store.Remove(r); err != nil {
 			return err
@@ -374,7 +451,7 @@ func (a *App) Remove(args []string, yes, dryRun bool) error {
 	if err := a.pruneState(); err != nil {
 		return err
 	}
-	return a.Build(false, nil)
+	return a.build(false, nil)
 }
 
 func (a *App) Move(fromArg, toArg string) error {
@@ -389,6 +466,11 @@ func (a *App) Move(fromArg, toArg string) error {
 	if err := a.prepare(); err != nil {
 		return err
 	}
+	unlock, err := a.lock()
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	srcs, err := a.Store.Expand([]string{fromArg})
 	if err != nil {
 		return err
@@ -442,7 +524,7 @@ func (a *App) Move(fromArg, toArg string) error {
 	if err := a.pruneState(); err != nil {
 		return err
 	}
-	if err := a.Build(false, renames); err != nil {
+	if err := a.build(false, renames); err != nil {
 		return err
 	}
 	for _, r := range turnedOff {
@@ -490,6 +572,11 @@ func (a *App) Use(arg string) error {
 	if r.Cluster == "" {
 		return fmt.Errorf("%s is a client; use takes a cluster: %s/<cluster>", r, r)
 	}
+	unlock, err := a.lock()
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	if !a.Store.Exists(r) {
 		return fmt.Errorf("%s: not found", r)
 	}
@@ -506,7 +593,7 @@ func (a *App) Use(arg string) error {
 	}
 	if cfg.Contexts[r.String()] == nil {
 		// Enabled but missing: the target was edited by hand. Bring it back.
-		if err := a.Build(false, nil); err != nil {
+		if err := a.build(false, nil); err != nil {
 			return err
 		}
 		if cfg, err = a.loadTarget(); err != nil {
@@ -536,19 +623,38 @@ func (a *App) Namespace(args []string) error {
 		return err
 	}
 	var refArg, ns string
-	switch len(args) {
-	case 0:
+	switch {
+	case len(args) == 0:
 		ctx := cfg.Contexts[cfg.CurrentContext]
 		if ctx == nil {
 			return errors.New("no current context; pick one with kx use <client/cluster>")
 		}
-		ns = ctx.Namespace
-		if ns == "" {
-			ns = "default"
-		}
-		fmt.Fprintln(a.Stdout, ns)
+		fmt.Fprintln(a.Stdout, orDefault(ctx.Namespace))
 		return nil
-	case 1:
+	case len(args) == 1 && strings.Contains(args[0], "/"):
+		// A namespace never has a slash, so this names a cluster to show.
+		r, err := store.ParseRef(args[0])
+		if err != nil {
+			return err
+		}
+		if r.Cluster == "" || !a.Store.Exists(r) {
+			return fmt.Errorf("%s: not a cluster kx manages", args[0])
+		}
+		if ctx := cfg.Contexts[r.String()]; ctx != nil {
+			fmt.Fprintln(a.Stdout, orDefault(ctx.Namespace))
+			return nil
+		}
+		stored, err := a.Store.Get(r)
+		if err != nil {
+			return err
+		}
+		ns := ""
+		if ctx := stored.Contexts[r.String()]; ctx != nil {
+			ns = ctx.Namespace
+		}
+		fmt.Fprintln(a.Stdout, orDefault(ns))
+		return nil
+	case len(args) == 1:
 		refArg, ns = cfg.CurrentContext, args[0]
 		if refArg == "" {
 			return errors.New("no current context; name the cluster: kx ns <client/cluster> <namespace>")
@@ -557,7 +663,7 @@ func (a *App) Namespace(args []string) error {
 		refArg, ns = args[0], args[1]
 	}
 	if errs := validation.IsDNS1123Label(ns); len(errs) > 0 {
-		return fmt.Errorf("invalid namespace %q: %s", ns, strings.Join(errs, "; "))
+		return &UsageError{Err: fmt.Errorf("invalid namespace %q: want lowercase letters, digits and '-', at most 63", ns)}
 	}
 	r, err := store.ParseRef(refArg)
 	if err != nil {
@@ -565,6 +671,15 @@ func (a *App) Namespace(args []string) error {
 	}
 	if r.Cluster == "" || !a.Store.Exists(r) {
 		return fmt.Errorf("%s: not a cluster kx manages", refArg)
+	}
+	unlock, err := a.lock()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	// Read again under the lock: another kx may have rebuilt it meanwhile.
+	if cfg, err = a.loadTarget(); err != nil {
+		return err
 	}
 
 	stored, err := a.Store.Get(r)
@@ -590,6 +705,13 @@ func (a *App) Namespace(args []string) error {
 	}
 	a.say("%s: namespace %s", r, ns)
 	return nil
+}
+
+func orDefault(ns string) string {
+	if ns == "" {
+		return "default"
+	}
+	return ns
 }
 
 func (a *App) pruneState() error {

@@ -53,7 +53,7 @@ kx import-current
 ```
 
 Everything goes under a client called `unsorted`, and the old file is copied to
-`~/.config/kx/backups`. Then sort things out:
+`~/.local/state/kx/backups`. Then sort things out:
 
 ```bash
 kx mv unsorted/kubernetes-admin-kubernetes acme/prod
@@ -146,7 +146,9 @@ kx off acme/stage
 ```
 
 A cluster that is off stays in `~/.config/kx` but disappears from
-`~/.kube/config`, so Lens and k9s stop showing it.
+`~/.kube/config`, so Lens and k9s stop showing it. Turning a client back on
+brings its clusters back the way they were: `acme/stage` above stays off
+after `kx off acme` and `kx on acme`.
 
 A project is over (removal always asks; without a terminal kx won't ask and
 wants `-y` instead):
@@ -226,14 +228,19 @@ kx owns `~/.kube/config` and rebuilds it from scratch, but:
   `yc managed-kubernetes cluster get-credentials` and so on), kx refuses to
   rebuild and tells you to run `kx import-current -c <client>`. It won't drop
   those contexts silently. `kx build --force` drops them on purpose.
-- Before every rewrite the old file is copied to `~/.config/kx/backups`. The
-  last ten are kept.
+- Before every rebuild the old file is copied to `~/.local/state/kx/backups`.
+  The last ten are kept. `kx use` and `kx ns` change one field and make no
+  backup.
 - If you edit `~/.kube/config` by hand, kx takes your edits instead of
   undoing them. Changed a token, a certificate or a server address of a
   cluster kx manages: kx copies it into its store and tells you so. Deleted
   one of its contexts: kx turns that cluster off (not removes it, `kx on`
-  brings it back). This happens before every kx command, and the interactive
+  brings it back). If none of several clusters is left, the file was emptied or
+  replaced, and kx writes them back instead of turning them all off. This
+  happens before every kx command except a `--dry-run`, and the interactive
   view notices edits while it's open. `kx sync` runs it on its own.
+- Two kx commands at once (the interactive view and a terminal, or an agent
+  running several) take turns, so neither loses the other's change.
 - A namespace you switched in k9s or with kubens is not reset on the next
   rebuild.
 - The current context is kept. It is only cleared when that cluster is turned
@@ -279,9 +286,10 @@ Global flags: `--no-color`, `--no-input` (never ask, fail instead), `-q` /
 |---|---|
 | 0 | done |
 | 1 | the command failed: a cluster is down or degraded in `check`, a file can't be written, you answered no |
-| 2 | kx was called wrong: unknown command or flag, missing argument, or a question it can't ask because stdin is not a terminal (pass `-y`) |
+| 2 | kx was called wrong: unknown command or flag, missing argument, invalid name or namespace, or a question it can't ask because stdin is not a terminal (pass `-y`) |
 
-`kx exec` exits with the code of the command it ran.
+`kx exec` exits with the code of the command it ran, or 127 if there is no
+such command.
 
 ## Storage
 
@@ -290,6 +298,7 @@ Global flags: `--no-color`, `--no-input` (never ask, fail instead), `-q` /
   clusters/acme/prod.yaml   one file per cluster, each one works on its own
   state.yaml                what is turned off
 ~/.local/state/kx/backups/  previous versions of ~/.kube/config (last ten)
+~/.local/state/kx/exec/     kubeconfigs of running kx exec commands
 ~/.cache/kx/checks.json     last check results
 ```
 

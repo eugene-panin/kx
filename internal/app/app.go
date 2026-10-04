@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/eugene-panin/kx/internal/store"
@@ -136,9 +137,29 @@ func (a *App) loadTarget() (*api.Config, error) {
 		return api.NewConfig(), nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("load %s: %w", a.Target, err)
+		return nil, fmt.Errorf("load %s: %w\nfix it by hand, or write it anew with `kx build --force` (previous versions are in %s)",
+			a.TargetName(), err, tilde(a.backupsDir()))
 	}
 	return cfg, nil
+}
+
+// lock serializes changes across kx processes: the interactive mode and a
+// command in another terminal, or an agent running several at once. Without it
+// two read-modify-write cycles of state.yaml lose one of the changes.
+func (a *App) lock() (unlock func(), err error) {
+	dir := a.Store.Dir()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(filepath.Join(dir, ".lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("lock %s: %w", f.Name(), err)
+	}
+	return func() { f.Close() }, nil
 }
 
 // Unmanaged returns contexts in the target kubeconfig that kx neither stores
@@ -181,13 +202,11 @@ func (a *App) checkTarget() error {
 		a.Target, strings.Join(names, "\n  "))
 }
 
-// prepare runs before any change: it refuses to touch a target holding foreign
-// contexts and pulls namespace switches made by other tools into the store.
+// prepare runs before any change: it refuses to touch a target holding
+// foreign contexts. Hand edits are taken in once per command, before it runs
+// (SyncAndReport), not here, so a dry run never writes.
 func (a *App) prepare() error {
-	if err := a.checkTarget(); err != nil {
-		return err
-	}
-	return a.SyncAndReport()
+	return a.checkTarget()
 }
 
 // SyncAndReport runs Sync and tells about the changes on Stderr.
@@ -199,9 +218,9 @@ func (a *App) SyncAndReport() error {
 	return err
 }
 
-// Build regenerates the target. renames maps old context names to new ones so
+// build regenerates the target. renames maps old context names to new ones so
 // that a renamed current-context survives.
-func (a *App) Build(force bool, renames map[string]string) error {
+func (a *App) build(force bool, renames map[string]string) error {
 	if !force {
 		if err := a.checkTarget(); err != nil {
 			return err
@@ -301,16 +320,15 @@ func (a *App) backup(data []byte) (string, error) {
 	return path, nil
 }
 
-// Rebuild is `kx build`: pull hand edits in, regenerate the target and say
-// what happened, including the foreign contexts --force drops. With force the
-// target may be unreadable, so taking hand edits in is best effort then.
-// dryRun says what would happen and writes nothing.
+// Rebuild is `kx build`: regenerate the target and say what happened,
+// including the foreign contexts --force drops. dryRun says what would happen
+// and writes nothing.
 func (a *App) Rebuild(force, dryRun bool) error {
-	if !dryRun {
-		if err := a.SyncAndReport(); err != nil && !force {
-			return err
-		}
+	unlock, err := a.lock()
+	if err != nil {
+		return err
 	}
+	defer unlock()
 	var dropped []string
 	if force {
 		// Best effort: an unreadable target has nothing to list.
@@ -329,7 +347,7 @@ func (a *App) Rebuild(force, dryRun bool) error {
 		fmt.Fprintf(a.Stdout, "would write %s: %s\n", a.TargetName(), plural(n, "cluster"))
 		return nil
 	}
-	if err := a.Build(force, nil); err != nil {
+	if err := a.build(force, nil); err != nil {
 		return err
 	}
 	for _, d := range dropped {

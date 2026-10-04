@@ -23,6 +23,7 @@ generated file.
   state.yaml           # what is turned off, plus what the last build generated
 ~/.local/state/kx/
   backups/             # the last 10 versions of ~/.kube/config
+  exec/                # kx-<pid>.yaml for each running kx exec
 ~/.cache/kx/
   checks.json          # last check results
 
@@ -64,14 +65,14 @@ kx build [--force]
 | command | what it does |
 |---|---|
 | `add` | Splits the input kubeconfig into contexts, renames them to `client/<name>`, inlines files and puts them in the store. `--context` takes only the named ones. `--name` sets the cluster name (single context only). By default the name is the original context name, sanitized (for an EKS ARN, the part after the last `/`). `--force` overwrites an existing cluster. Before anything is written, every context must have an http(s) server address and credentials (token, token file, client certificate with key, exec or auth-provider plugin, basic auth); otherwise the whole add fails and says what is missing. `--check` probes the added clusters right after (like `check`, one line each) and exits 1 if a check fails; the clusters stay added. |
-| `ls` | Table of `CLIENT CLUSTER SERVER NAMESPACE VERSION STATE`, `*` marks the current context. VERSION comes from the last check. `--json` for scripts and agents, no credentials. |
+| `ls` | Table of `CLIENT CLUSTER SERVER NAMESPACE VERSION STATE`, `*` marks the current context. In a pipe every line has the same fields: a `CURRENT` column with `*` or `-` comes first and empty cells are `-`. VERSION comes from the last check. `--json` for scripts and agents, no credentials. |
 | `use` | Sets `current-context`, the cluster kubectl, helm and k9s talk to by default. Without an argument prints the current one. Only that one field is rewritten, with no rebuild and no backup, so switching back and forth doesn't push useful backups out. A cluster that is off can't be made current; turning off or removing the current cluster clears `current-context`. |
 | `ns` | Prints or sets the default namespace: of the current context, or of the named cluster (even one that is off). Written to the target and to the store, rewriting only that field, with no rebuild and no backup. The name is checked against Kubernetes rules (DNS-1123 label) but not looked up in the cluster, so it works offline. |
-| `on`/`off` | Turn on or off. `on acme/prod` while `acme` is off turns on prod only. |
+| `on`/`off` | Turn on or off. `on acme/prod` while `acme` is off turns on prod only. `off acme` remembers which of its clusters were off already, and `on acme` brings that back; `on acme` when acme as a whole wasn't off turns every cluster on. For a client the output counts its clusters and names the ones still off. Every argument is checked first, and if `~/.kube/config` can't be written the state is put back as it was. |
 | `rm` | Remove. Always asks first, one cluster or many: once a cluster is off, the store holds the only copy of its credentials. `-y` skips the question. Without a terminal there's no question at all: kx exits 2 and asks for `-y`. |
 | `mv` | `mv acme/old acme/new` renames a cluster, `mv unsorted/x acme` moves it to a client, `mv acme acme-corp` renames a client. |
 | `export` | Prints a kubeconfig with the given clusters to stdout, including ones that are off. |
-| `exec` | Runs a command with `KUBECONFIG` pointing at a temporary file holding just the given clusters (including ones that are off). The first one is current. Sets `KX_SCOPE`. Exits with the command's exit code. The temporary file is removed afterwards. |
+| `exec` | Runs a command with `KUBECONFIG` pointing at a temporary file holding just the given clusters (including ones that are off). The first one is current. Sets `KX_SCOPE`. Exits with the command's exit code (127 if it isn't found, 126 if it can't be run). The temporary file is `exec/kx-<pid>.yaml` in the state dir, removed afterwards; one left by a kx killed with -9 is removed by the next `exec`. |
 | `check` | For each cluster, in parallel: `/version` (reachable, version), then `SelfSubjectReview` (credentials work, as whom; `GET /api` before 1.28), then `/readyz?verbose` (HEALTH `ok`/`degraded` plus what failed; `/healthz` before 1.16), then nodes (NODES `ready/total`, using the Table rendering, a few hundred bytes per node). Client certificate and JWT expiry is read locally. No permission for readyz or nodes leaves the column empty. Checks the clusters that are on by default. Exits 1 if any cluster is down or degraded. Errors, failed readyz checks and outdated versions are listed under the table. Results are saved to `checks.json`. A terminal gets "checking N clusters…" on stderr while it waits; Ctrl-C stops it with exit 130. |
 | `import-current` | Takes over every context in `~/.kube/config` that isn't in the store, under client `-c` (`unsorted` by default). Sort them out with `mv` afterwards. |
 | `sync` | Takes hand edits of `~/.kube/config` into the store (see below). Every command does this first; `sync` runs it alone. |
@@ -81,8 +82,8 @@ kx build [--force]
 
 0 done; 1 the command failed (a cluster down or degraded in `check`, a write
 error, a "no" to a question); 2 kx was called wrong (unknown command or flag,
-missing argument, invalid value, or a confirmation that can't be asked because
-stdin is not a terminal). `exec` passes the child's code through. Usage errors
+missing argument, invalid name or namespace, or a confirmation that can't be
+asked because stdin is not a terminal). `exec` passes the child's code through. Usage errors
 end with a pointer to the command's `--help`; a typo in a command name gets a
 "did you mean"; `-h` anywhere on the line shows help even next to a bad flag.
 
@@ -120,7 +121,8 @@ doesn't silently wipe their work:
 - if there are any, it stops and suggests `kx import-current -c <client>` or
   `kx build --force` (drop them).
 
-Before every rewrite of `~/.kube/config` the old version goes to `backups/`.
+Before every rebuild of `~/.kube/config` the old version goes to `backups/`
+(`use` and `ns` change one field and make none).
 Writes are atomic (temp file plus rename) with mode 0600. If the content
 didn't change, the file isn't touched.
 
@@ -138,14 +140,17 @@ of undoing it on the next rebuild:
   are reported; namespace switches (k9s, kubens) are taken silently;
 - a managed context that the last build wrote but that is gone now is turned
   off, not removed, and reported. `kx on` brings it back;
-- if the whole file is gone, or none of the contexts the last build wrote is
-  left in it (emptied by a crashed editor, `>` instead of `>>`), that's a reset
-  rather than a list of deletions:
-  nothing is turned off and the next build writes everything again;
+- if the whole file is gone, or none of several contexts the last build wrote
+  is left in it (emptied by a crashed editor, `>` instead of `>>`), that's a
+  reset rather than a list of deletions: nothing is turned off and the next
+  build writes everything again. A single context gone is a deletion, even
+  when it was the only one: that's what removing the last cluster in Lens
+  looks like;
 - contexts kx doesn't manage are left alone (see above).
 
-This runs before every command (a failure is only a warning, so a broken file
-doesn't block `kx build --force`), at the start of the interactive mode, and
+This runs once before every command except a `--dry-run` (a failure is only a
+warning, given after the command, so a broken file doesn't block
+`kx build --force`), at the start of the interactive mode, and
 whenever the interactive mode sees the file change (it looks every two
 seconds). `kx sync` runs it on its own.
 

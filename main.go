@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -8,10 +9,12 @@ import (
 	"os/signal"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/eugene-panin/kx/internal/app"
 	"github.com/eugene-panin/kx/internal/probe"
+	"github.com/eugene-panin/kx/internal/store"
 	"github.com/eugene-panin/kx/internal/table"
 	"github.com/eugene-panin/kx/internal/tui"
 	"github.com/spf13/cobra"
@@ -56,6 +59,9 @@ func report(err error, stderr io.Writer) int {
 			fmt.Fprintln(stderr, usage.Hint)
 		}
 		return 2
+	case errors.Is(err, store.ErrInvalidName):
+		fmt.Fprintln(stderr, "kx:", err)
+		return 2
 	default:
 		fmt.Fprintln(stderr, "kx:", err)
 		return 1
@@ -67,17 +73,37 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	root := cli{a}.command()
+	var syncErr error
+	root := cli{a, &syncErr}.command()
 	root.SetArgs(args)
 	root.SetIn(stdin)
-	root.SetOut(stdout)
+	root.SetOut(flagWarnings{stdout, stderr})
 	root.SetErr(stderr)
 	root.SetFlagErrorFunc(helpWins(args))
 	cmd, err := root.ExecuteC()
 	if err != nil && isCobraUsage(err) {
 		return &app.UsageError{Err: err, Hint: "Run '" + cmd.CommandPath() + " --help' for usage."}
 	}
+	// The sync before the command failed. Say so, unless the command failed
+	// on the same broken file and says it already, or build --force just
+	// replaced that file.
+	if force, _ := cmd.Flags().GetBool("force"); syncErr != nil && !(cmd.Name() == "build" && force && err == nil) &&
+		(err == nil || !strings.Contains(err.Error(), syncErr.Error())) {
+		fmt.Fprintln(stderr, "kx: sync with", a.TargetName()+":", syncErr)
+	}
 	return err
+}
+
+// flagWarnings is stdout for cobra, except for pflag's deprecation warnings:
+// cobra prints those through the same writer as help, and they belong on
+// stderr [B4].
+type flagWarnings struct{ stdout, stderr io.Writer }
+
+func (w flagWarnings) Write(p []byte) (int, error) {
+	if bytes.HasPrefix(p, []byte("Flag shorthand -")) || bytes.HasPrefix(p, []byte("Flag --")) {
+		return w.stderr.Write(p)
+	}
+	return w.stdout.Write(p)
 }
 
 // helpWins turns a flag error into help when -h or --help is on the line, so
@@ -110,6 +136,7 @@ func isCobraUsage(err error) bool {
 // cli wires App into cobra commands.
 type cli struct {
 	*app.App
+	syncErr *error // a failed sync before the command, reported after it
 }
 
 // usageTemplate is cobra's default with the examples moved to the top: people
@@ -169,9 +196,12 @@ func positive(d time.Duration) error {
 	return nil
 }
 
+// unsorted guards cobra's global sorting switch: tests build commands in parallel.
+var unsorted sync.Once
+
 func (a cli) command() *cobra.Command {
 	// Commands are listed in the order added, grouped, common ones first [H8].
-	cobra.EnableCommandSorting = false
+	unsorted.Do(func() { cobra.EnableCommandSorting = false })
 	root := &cobra.Command{
 		Use:   "kx",
 		Short: "Manage kubeconfig clusters grouped by client",
@@ -199,26 +229,25 @@ Issues: https://github.com/eugene-panin/kx/issues`,
 		// No Args validator: cobra's default for a root with subcommands is
 		// what turns `kx lss` into "unknown command ... Did you mean ls?".
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if !table.IsTerminal(a.Stdin) || !table.IsTerminal(a.Stdout) {
+			if a.NoInput || !table.IsTerminal(a.Stdin) || !table.IsTerminal(a.Stdout) {
 				return cmd.Help()
 			}
 			return tui.Run(a.App)
 		},
-		// Hand edits of ~/.kube/config are taken in before any command looks
-		// at the store. A broken file must not block kx build --force, so a
-		// failure here is only a warning.
+		// Hand edits of ~/.kube/config are taken in once, before any command
+		// looks at the store; a dry run promises to write nothing, so it
+		// skips this. A broken file must not block kx build --force, so a
+		// failure here is only a warning, given after the command.
 		PersistentPreRun: func(cmd *cobra.Command, args []string) {
 			switch cmd.Name() {
 			case "completion", "help", cobra.ShellCompRequestCmd, cobra.ShellCompNoDescRequestCmd:
 				return
 			}
 			a.MoveOldFiles()
-			if cmd.Name() == "sync" {
+			if dry, _ := cmd.Flags().GetBool("dry-run"); dry || cmd.Name() == "sync" {
 				return
 			}
-			if err := a.SyncAndReport(); err != nil {
-				fmt.Fprintln(a.Stderr, "kx: sync with", a.TargetName()+":", err)
-			}
+			*a.syncErr = a.SyncAndReport()
 		},
 	}
 	root.SetUsageTemplate(usageTemplate)
@@ -499,8 +528,8 @@ store stay readable.`,
 		Example: `  kx ui`,
 		Args:    cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if !table.IsTerminal(a.Stdin) || !table.IsTerminal(a.Stdout) {
-				return &app.UsageError{Err: errors.New("kx ui needs a terminal"), Hint: "the commands in kx --help do everything it does"}
+			if a.NoInput || !table.IsTerminal(a.Stdin) || !table.IsTerminal(a.Stdout) {
+				return &app.UsageError{Err: errors.New("kx ui needs a terminal and input"), Hint: "the commands in kx --help do everything it does"}
 			}
 			return tui.Run(a.App)
 		},
@@ -523,7 +552,7 @@ alone; take them over with kx import-current.`,
 			for _, n := range notes {
 				fmt.Fprintln(a.Stdout, n)
 			}
-			if err == nil && len(notes) == 0 {
+			if err == nil && len(notes) == 0 && !a.Quiet {
 				fmt.Fprintln(a.Stdout, "nothing to sync")
 			}
 			return err
@@ -544,10 +573,28 @@ its own. --force drops contexts kx doesn't manage, after saving a backup.`,
 			return a.Rebuild(buildForce, buildDry)
 		},
 	}
-	build.Flags().BoolVar(&buildForce, "force", false, "drop contexts kx does not manage")
+	build.Flags().BoolVarP(&buildForce, "force", "f", false, "drop contexts kx does not manage")
 	build.Flags().BoolVar(&buildDry, "dry-run", false, "say what would be written and dropped, write nothing")
 
 	root.AddCommand(add, ls, on, off, rm, mv, importCurrent, use, ns, check, export, execCmd, ui, sync, build)
+
+	// cobra's own help command prints "Unknown help topic" to stdout and
+	// exits 0; a typo there is a usage error like anywhere else [H10].
+	root.SetHelpCommand(&cobra.Command{
+		Use:   "help [command]",
+		Short: "Help about any command",
+		RunE: func(c *cobra.Command, args []string) error {
+			cmd, _, err := root.Find(args)
+			if cmd == nil || err != nil || len(args) > 0 && cmd == root {
+				hint := "Run 'kx --help' for the list of commands."
+				if s := root.SuggestionsFor(args[len(args)-1]); len(s) > 0 {
+					hint = "Did you mean this?\n\t" + strings.Join(s, "\n\t")
+				}
+				return &app.UsageError{Err: fmt.Errorf("unknown help topic %q", strings.Join(args, " ")), Hint: hint}
+			}
+			return cmd.Help()
+		},
+	})
 	return root
 }
 

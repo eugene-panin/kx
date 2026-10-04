@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -29,13 +28,23 @@ import (
 type keyMap struct {
 	Up, Down, Top, Bottom, PageUp, PageDown                                         key.Binding
 	Use, Namespace, Toggle, Paste, Add, Check, Rename, Delete, Import, Filter, Quit key.Binding
+	More                                                                            key.Binding
 }
 
-func (k keyMap) ShortHelp() []key.Binding {
-	return []key.Binding{k.Use, k.Namespace, k.Toggle, k.Paste, k.Add, k.Check, k.Rename, k.Delete, k.Filter, k.Quit}
-}
+// helpLine is one line of key help. Not every key fits on a narrow terminal,
+// so ? flips between two lines, and each ends with ? and q so those two are
+// never cut off.
+type helpLine []key.Binding
 
-func (k keyMap) FullHelp() [][]key.Binding { return [][]key.Binding{k.ShortHelp()} }
+func (h helpLine) ShortHelp() []key.Binding  { return h }
+func (h helpLine) FullHelp() [][]key.Binding { return [][]key.Binding{h} }
+
+func (k keyMap) line(more bool) helpLine {
+	if more {
+		return helpLine{k.Namespace, k.Paste, k.Check, k.Rename, k.Import, k.More, k.Quit}
+	}
+	return helpLine{k.Use, k.Toggle, k.Add, k.Delete, k.Filter, k.More, k.Quit}
+}
 
 var keys = keyMap{
 	Up:        key.NewBinding(key.WithKeys("up", "k")),
@@ -55,6 +64,7 @@ var keys = keyMap{
 	Import:    key.NewBinding(key.WithKeys("i"), key.WithHelp("i", "import")),
 	Filter:    key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "filter")),
 	Quit:      key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit")),
+	More:      key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "more keys")),
 }
 
 // item is a line of the tree: a client header or one of its clusters.
@@ -94,6 +104,7 @@ type (
 	}
 	doneMsg struct {
 		status string
+		warn   string // what the command said on stderr, such as a lost current-context
 		err    error
 		added  []store.Ref // clusters to check and select once reloaded
 	}
@@ -109,6 +120,8 @@ const fixedLines = 5
 type model struct {
 	a *app.App
 	o *table.Output
+
+	moreKeys bool // the help line shows the second set of keys
 
 	rows    []app.ListRow
 	st      *store.State
@@ -252,11 +265,21 @@ func (m model) change(fn func(q *app.App) ([]store.Ref, error)) (tea.Model, tea.
 	m.busy = true
 	a := m.a
 	return m, func() tea.Msg {
-		var out bytes.Buffer
+		var out, warn bytes.Buffer
 		q := *a
-		q.Stdin, q.Stdout, q.Stderr = strings.NewReader(""), &out, io.Discard
+		q.Stdin, q.Stdout, q.Stderr = strings.NewReader(""), &out, &warn
+		// The watch may not have seen the latest hand edit yet; the CLI
+		// takes them in before every command, and so does this.
+		if err := q.SyncAndReport(); err != nil {
+			return doneMsg{err: err}
+		}
 		added, err := fn(&q)
-		return doneMsg{status: summarize(out.String()), err: err, added: added}
+		lines := strings.ReplaceAll(strings.TrimSpace(warn.String()), "kx: ", "")
+		w := ""
+		if lines != "" {
+			w = summarize(lines)
+		}
+		return doneMsg{status: summarize(out.String()), warn: w, err: err, added: added}
 	}
 }
 
@@ -324,8 +347,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case doneMsg:
 		m.busy = false
 		m.status, m.failed = msg.status, false
+		if msg.warn != "" {
+			m.status, m.notice = msg.warn, true
+		}
 		if msg.err != nil {
-			m.status, m.failed = firstLine(msg.err), true
+			m.status, m.failed, m.notice = firstLine(msg.err), true, false
 		}
 		if len(msg.added) == 0 {
 			return m, m.load()
@@ -367,6 +393,9 @@ func (m model) updateNormal(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch {
 	case key.Matches(msg, keys.Quit):
 		return m, tea.Quit
+	case key.Matches(msg, keys.More):
+		m.moreKeys = !m.moreKeys
+		return m, nil
 	case msg.String() == "esc":
 		if m.filter != "" {
 			m.filter = ""
@@ -737,7 +766,7 @@ func (m model) screen() string {
 	}
 	b.WriteString(fitLine(m.detail(&o)) + "\n")
 	b.WriteString(fitLine(m.statusLine(&o)) + "\n")
-	b.WriteString(fitLine(m.help.View(keys)))
+	b.WriteString(fitLine(m.help.View(keys.line(m.moreKeys))))
 	return b.String()
 }
 

@@ -26,11 +26,15 @@ func (r Ref) String() string {
 	return r.Client + "/" + r.Cluster
 }
 
+// ErrInvalidName marks a client, cluster or ref that isn't [A-Za-z0-9._-]:
+// a usage error, not a failure.
+var ErrInvalidName = errors.New("invalid name")
+
 func ParseRef(s string) (Ref, error) {
 	client, cluster, _ := strings.Cut(s, "/")
 	r := Ref{Client: client, Cluster: cluster}
 	if !ValidName(client) || strings.Contains(s, "/") && !ValidName(cluster) {
-		return Ref{}, fmt.Errorf("invalid name %q: want <client> or <client>/<cluster> of [A-Za-z0-9._-]", s)
+		return Ref{}, fmt.Errorf("%w %q: want <client> or <client>/<cluster> of [A-Za-z0-9._-]", ErrInvalidName, s)
 	}
 	return r, nil
 }
@@ -112,7 +116,7 @@ func (s *Store) Exists(r Ref) bool {
 func (s *Store) Get(r Ref) (*api.Config, error) {
 	cfg, err := clientcmd.LoadFromFile(s.path(r))
 	if err != nil {
-		return nil, fmt.Errorf("load %s: %w", r, err)
+		return nil, fmt.Errorf("load %s from %s: %w", r, s.path(r), err)
 	}
 	return cfg, nil
 }
@@ -195,28 +199,33 @@ func (st *State) Forget(r Ref) {
 	})
 }
 
+// Disable turns r off. Turning a client off keeps the entries of its clusters
+// that were off already, so turning it back on restores them as they were.
 func (st *State) Disable(r Ref) {
-	if r.Cluster == "" {
-		st.Forget(r)
-	} else if slices.Contains(st.Disabled, r.Client) {
+	if r.Cluster != "" && slices.Contains(st.Disabled, r.Client) {
 		return
 	}
 	st.Disabled = append(st.Disabled, r.String())
 }
 
-// Enable turns r on. Enabling one cluster of a disabled client keeps its
+// Enable turns r on. For a client that was turned off as a whole, its
+// clusters come back as they were before; otherwise every cluster of the
+// client goes on. Enabling one cluster of a disabled client keeps its
 // siblings off, so the client entry is replaced with per-cluster entries.
 func (st *State) Enable(r Ref, siblings []Ref) {
-	if r.Cluster != "" && slices.Contains(st.Disabled, r.Client) {
+	switch {
+	case r.Cluster == "" && slices.Contains(st.Disabled, r.Client):
+		st.Disabled = slices.DeleteFunc(st.Disabled, func(d string) bool { return d == r.Client })
+	case r.Cluster != "" && slices.Contains(st.Disabled, r.Client):
 		st.Forget(Ref{Client: r.Client})
 		for _, s := range siblings {
 			if s.Client == r.Client && s != r {
 				st.Disabled = append(st.Disabled, s.String())
 			}
 		}
-		return
+	default:
+		st.Forget(r)
 	}
-	st.Forget(r)
 }
 
 // Prune drops disabled entries pointing at clients or clusters that no longer exist.
@@ -234,7 +243,12 @@ func WriteFile(path string, data []byte) (err error) {
 	}
 	f, err := os.CreateTemp(dir, ".kx-*")
 	if err != nil {
-		return err
+		// The temp name means nothing to the user; the file being written does.
+		var pe *fs.PathError
+		if errors.As(err, &pe) {
+			err = pe.Err
+		}
+		return fmt.Errorf("write %s: %w", path, err)
 	}
 	defer func() {
 		if err != nil {

@@ -21,6 +21,14 @@ import (
 // change worth telling about; namespace switches (k9s, kubens) are taken
 // silently. Contexts kx doesn't manage are left for import-current.
 func (a *App) Sync() ([]string, error) {
+	if _, err := os.Stat(a.Store.Dir()); errors.Is(err, fs.ErrNotExist) {
+		return nil, nil // nothing stored, nothing to sync
+	}
+	unlock, err := a.lock()
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	if _, err := os.Stat(a.Target); errors.Is(err, fs.ErrNotExist) {
 		// The whole file is gone: that's a reset, not a list of deletions.
 		return nil, nil
@@ -37,10 +45,12 @@ func (a *App) Sync() ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	// None of what the last build wrote is left: the file was emptied or
-	// replaced wholesale (a crashed editor, `>` instead of `>>`). Like a missing
-	// file, that's a reset, not a list of deliberate deletions.
-	if len(st.Generated) > 0 && !slices.ContainsFunc(st.Generated, func(g string) bool { return cur.Contexts[g] != nil }) {
+	// None of several clusters the last build wrote is left: the file was
+	// emptied or replaced wholesale (a crashed editor, `>` instead of `>>`).
+	// Like a missing file, that's a reset, not a list of deliberate deletions.
+	// A single one gone is a deletion: Lens removing the last cluster looks
+	// exactly like that.
+	if len(st.Generated) > 1 && !slices.ContainsFunc(st.Generated, func(g string) bool { return cur.Contexts[g] != nil }) {
 		return []string{a.TargetName() + " has none of the clusters kx put there; kx build writes them again"}, nil
 	}
 	var notes []string

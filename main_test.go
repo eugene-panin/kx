@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -396,7 +397,10 @@ func TestUse(t *testing.T) {
 	if out := e.ok("use"); strings.TrimSpace(out) != "acme/prod" {
 		t.Errorf("use prints %q", out)
 	}
-	if out := e.ok("ls"); !strings.Contains(out, "*  acme    prod") {
+	if out := e.ok("ls"); !slices.ContainsFunc(strings.Split(out, "\n"), func(l string) bool {
+		f := strings.Fields(l)
+		return len(f) > 2 && f[0] == "*" && f[1] == "acme" && f[2] == "prod"
+	}) {
 		t.Errorf("ls does not mark the current cluster:\n%s", out)
 	}
 	if backups() != before {
@@ -853,9 +857,12 @@ func TestNotAKubeconfig(t *testing.T) {
 func TestPipedTableHasNoEmptyCells(t *testing.T) {
 	e := newEnv(t)
 	e.ok("add", e.Kubeconfig("a.yaml", "https://a"), "-c", "acme", "--name", "prod")
-	for _, l := range strings.Split(strings.TrimSpace(e.ok("ls")), "\n")[1:] {
-		// CLIENT CLUSTER SERVER NAMESPACE VERSION STATE, mark column aside
-		if f := strings.Fields(l); len(f) != 6 {
+	e.ok("add", e.Kubeconfig("b.yaml", "https://b"), "-c", "acme", "--name", "stage")
+	e.ok("use", "acme/prod")
+	// The same fields on every line, header and current row included, so
+	// awk '{print $2}' is the client everywhere.
+	for _, l := range strings.Split(strings.TrimSpace(e.ok("ls")), "\n") {
+		if f := strings.Fields(l); len(f) != 7 {
 			t.Errorf("row has %d fields, empty cells must be '-': %q", len(f), l)
 		}
 	}
@@ -923,5 +930,158 @@ func TestOldFilesMoveToXDG(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(old, "checks.json")); err != nil {
 		t.Error("--help moved files")
+	}
+}
+
+func TestClientOnRestoresItsClusters(t *testing.T) {
+	e := newEnv(t)
+	e.ok("add", e.Kubeconfig("a.yaml", "https://a"), "-c", "acme", "-n", "prod")
+	e.ok("add", e.Kubeconfig("b.yaml", "https://b"), "-c", "acme", "-n", "stage")
+	e.ok("off", "acme/stage")
+	if out := e.ok("off", "acme"); !strings.Contains(out, "acme: off (2 clusters)") {
+		t.Errorf("off acme:\n%s", out)
+	}
+	if out := e.ok("on", "acme"); !strings.Contains(out, "still off: stage") {
+		t.Errorf("on acme doesn't say stage stays off:\n%s", out)
+	}
+	e.WantContexts("acme/prod")
+	// Not off as a whole now, so on means every cluster.
+	e.ok("on", "acme")
+	e.WantContexts("acme/prod", "acme/stage")
+}
+
+func TestDryRunTakesNoHandEdits(t *testing.T) {
+	e := newEnv(t)
+	e.ok("add", e.Kubeconfig("a.yaml", "https://a"), "-c", "acme", "-n", "prod")
+	e.ok("add", e.Kubeconfig("b.yaml", "https://b"), "-c", "acme", "-n", "stage")
+	editTarget(t, e, func(cfg *api.Config) { delete(cfg.Contexts, "acme/stage") })
+	state := filepath.Join(e.Home, "state.yaml")
+	before, err := os.ReadFile(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"rm", "acme/prod", "--dry-run"}, {"build", "--dry-run"}} {
+		if out := e.ok(args...); strings.Contains(out, "turned off") {
+			t.Errorf("kx %v synced:\n%s", args, out)
+		}
+		if after, _ := os.ReadFile(state); !bytes.Equal(before, after) {
+			t.Errorf("kx %v changed state.yaml", args)
+		}
+	}
+}
+
+func TestDeletingTheOnlyContextTurnsItOff(t *testing.T) {
+	e := newEnv(t)
+	e.ok("add", e.Kubeconfig("a.yaml", "https://a"), "-c", "acme", "-n", "prod")
+	editTarget(t, e, func(cfg *api.Config) { delete(cfg.Contexts, "acme/prod") }) // Lens "Remove"
+	if out := e.ok("ls"); !strings.Contains(out, "acme/prod: removed from") {
+		t.Errorf("deleting the last context was taken for a reset:\n%s", out)
+	}
+	e.ok("build")
+	e.WantContexts()
+}
+
+func TestAddForceSaysReplaced(t *testing.T) {
+	e := newEnv(t)
+	e.ok("add", e.Kubeconfig("a.yaml", "https://a"), "-c", "acme", "--name", "prod")
+	e.ok("ns", "acme/prod", "monitoring")
+	e.ok("off", "acme/prod")
+	out := e.ok("add", e.Kubeconfig("b.yaml", "https://b"), "-c", "acme", "--name", "prod", "--force")
+	if !strings.Contains(out, "replaced acme/prod") || !strings.Contains(out, "acme/prod stays off") {
+		t.Errorf("add --force over a cluster that is off:\n%s", out)
+	}
+	if out := e.ok("ns", "acme/prod"); strings.TrimSpace(out) != "monitoring" {
+		t.Errorf("namespace after add --force: %q", out)
+	}
+}
+
+func TestParallelChangesAreNotLost(t *testing.T) {
+	e := newEnv(t)
+	names := []string{"a", "b", "c", "d", "e", "f"}
+	for _, n := range names {
+		e.ok("add", e.Kubeconfig(n+".yaml", "https://"+n), "-c", "acme", "--name", n)
+		e.ok("off", "acme/"+n)
+	}
+	var wg sync.WaitGroup
+	for _, n := range names {
+		wg.Go(func() {
+			if err := run([]string{"on", "acme/" + n}, strings.NewReader(""), io.Discard, io.Discard); err != nil {
+				t.Errorf("on acme/%s: %v", n, err)
+			}
+		})
+	}
+	wg.Wait()
+	e.WantContexts("acme/a", "acme/b", "acme/c", "acme/d", "acme/e", "acme/f")
+}
+
+func TestFailedWriteKeepsState(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root writes anywhere")
+	}
+	e := newEnv(t)
+	e.ok("add", e.Kubeconfig("a.yaml", "https://a"), "-c", "acme", "--name", "prod")
+	dir := filepath.Dir(e.Target)
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	_, err := e.run("", "off", "acme/prod")
+	os.Chmod(dir, 0o700)
+	if err == nil || strings.Contains(err.Error(), ".kx-") {
+		t.Errorf("off with a read-only ~/.kube: %v", err)
+	}
+	if out := e.ok("ls"); strings.Contains(out, "off") {
+		t.Errorf("state says off although the file still has it:\n%s", out)
+	}
+}
+
+func TestBadValuesAreUsageErrors(t *testing.T) {
+	e := newEnv(t)
+	e.ok("add", e.Kubeconfig("a.yaml", "https://a"), "-c", "acme", "--name", "prod")
+	for _, args := range [][]string{
+		{"add", e.Kubeconfig("b.yaml", "https://b"), "-c", "bad name"},
+		{"off", "a b"},
+		{"ns", "acme/prod", "Bad_NS"},
+		{"help", "lss"},
+	} {
+		out, err := e.run("", args...)
+		if code := report(err, io.Discard); code != 2 {
+			t.Errorf("kx %v: exit %d, want 2 (%v)\n%s", args, code, err, out)
+		}
+	}
+	if _, err := e.run("", "help", "lss"); err == nil || !strings.Contains(err.Error(), "lss") {
+		t.Errorf("help lss: %v", err)
+	}
+}
+
+func TestNamespaceOfACluster(t *testing.T) {
+	e := newEnv(t)
+	e.ok("add", e.Kubeconfig("a.yaml", "https://a"), "-c", "acme", "--name", "prod")
+	if out := e.ok("ns", "acme/prod"); strings.TrimSpace(out) != "default" {
+		t.Errorf("ns acme/prod: %q", out)
+	}
+}
+
+func TestWarningsStayOffStdout(t *testing.T) {
+	e := newEnv(t)
+	var out, errOut bytes.Buffer
+	if err := run([]string{"-v"}, strings.NewReader(""), &out, &errOut); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out.String(), "deprecated") || !strings.Contains(errOut.String(), "use --version") {
+		t.Errorf("-v: stdout %q, stderr %q", out.String(), errOut.String())
+	}
+	_ = e
+}
+
+func TestExecMissingCommand(t *testing.T) {
+	e := newEnv(t)
+	e.ok("add", e.Kubeconfig("a.yaml", "https://a"), "-c", "acme", "--name", "prod")
+	out, err := e.run("", "exec", "acme", "--", "kx-no-such-command")
+	if code := report(err, io.Discard); code != 127 || !strings.Contains(out, "command not found") {
+		t.Errorf("exec of a missing command: exit %d\n%s", code, out)
+	}
+	entries, _ := os.ReadDir(filepath.Join(e.Home, "exec"))
+	if len(entries) != 0 {
+		t.Errorf("exec left %d files behind", len(entries))
 	}
 }

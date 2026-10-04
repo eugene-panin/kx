@@ -3,9 +3,11 @@ package app
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 
@@ -67,7 +69,14 @@ func (a *App) Scope(args []string) (path string, cleanup func(), err error) {
 	if err != nil {
 		return "", nil, err
 	}
-	f, err := os.CreateTemp("", "kx-*.yaml")
+	// Named by pid in kx's own state dir, not in $TMPDIR: a kx killed with
+	// -9 can't remove the file, and the next exec finds and removes it.
+	dir := filepath.Join(a.stateDir, "exec")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", nil, err
+	}
+	removeOrphans(dir)
+	f, err := os.OpenFile(filepath.Join(dir, fmt.Sprintf("kx-%d.yaml", os.Getpid())), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
 	if err != nil {
 		return "", nil, err
 	}
@@ -82,6 +91,20 @@ func (a *App) Scope(args []string) (path string, cleanup func(), err error) {
 		return "", nil, err
 	}
 	return f.Name(), cleanup, nil
+}
+
+// removeOrphans deletes scoped kubeconfigs whose kx is gone.
+func removeOrphans(dir string) {
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		var pid int
+		if _, err := fmt.Sscanf(e.Name(), "kx-%d.yaml", &pid); err != nil {
+			continue
+		}
+		if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) {
+			os.Remove(filepath.Join(dir, e.Name()))
+		}
+	}
 }
 
 func ScopeEnv(path string, args []string) []string {
@@ -101,7 +124,13 @@ func (a *App) Exec(args, command []string) error {
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = a.Stdin, a.Stdout, a.Stderr
 	cmd.Env = ScopeEnv(path, args)
 	if err := cmd.Start(); err != nil {
-		return err
+		// What a shell would say and exit with [B2].
+		if errors.Is(err, exec.ErrNotFound) || errors.Is(err, fs.ErrNotExist) {
+			fmt.Fprintf(a.Stderr, "kx: %s: command not found\n", command[0])
+			return ExitError(127)
+		}
+		fmt.Fprintf(a.Stderr, "kx: %s: %v\n", command[0], err)
+		return ExitError(126)
 	}
 
 	// Stay alive until the child exits so the temp file gets removed. Ctrl-C
