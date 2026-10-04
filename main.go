@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -14,7 +15,20 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// version is set with -ldflags "-X main.version=..." in release builds.
 var version = "dev"
+
+// buildVersion falls back to the module version Go stamps into the binary:
+// v0.1.0 for go install ...@v0.1.0, a pseudo-version for a local checkout.
+func buildVersion() string {
+	if version != "dev" {
+		return version
+	}
+	if bi, ok := debug.ReadBuildInfo(); ok && bi.Main.Version != "" && bi.Main.Version != "(devel)" {
+		return bi.Main.Version
+	}
+	return version
+}
 
 func main() {
 	err := run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr)
@@ -53,7 +67,7 @@ func (a cli) command() *cobra.Command {
 		Long: `kx keeps every cluster as a separate kubeconfig under $KX_HOME (~/.config/kx)
 and generates ~/.kube/config ($KX_KUBECONFIG) from the enabled ones.
 Clusters are addressed as <client>/<cluster>.`,
-		Version:       version,
+		Version:       buildVersion(),
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		Args:          cobra.NoArgs,
