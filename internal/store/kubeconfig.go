@@ -1,8 +1,10 @@
 package store
 
 import (
+	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -83,6 +85,37 @@ func Extract(cfg *api.Config, ctx, name string) (*api.Config, error) {
 		return nil, fmt.Errorf("context %q: inline certificate files: %w", ctx, err)
 	}
 	return out, nil
+}
+
+// Validate checks that a config made by Extract can work at all: the cluster
+// has an http(s) server address and the user carries some credentials.
+func Validate(cfg *api.Config, name string) error {
+	ctx := cfg.Contexts[name]
+	if ctx == nil {
+		return fmt.Errorf("context %q not found", name)
+	}
+	cl := cfg.Clusters[ctx.Cluster]
+	if cl == nil || cl.Server == "" {
+		return errors.New("no server address")
+	}
+	u, err := url.Parse(cl.Server)
+	if err != nil || u.Host == "" || u.Scheme != "https" && u.Scheme != "http" {
+		return fmt.Errorf("server %q is not an http(s) URL", cl.Server)
+	}
+	ai := cfg.AuthInfos[ctx.AuthInfo]
+	if ai == nil {
+		return errors.New("no user, so no credentials")
+	}
+	cert, key := len(ai.ClientCertificateData) > 0, len(ai.ClientKeyData) > 0
+	switch {
+	case cert && !key:
+		return errors.New("client certificate without its key")
+	case key && !cert:
+		return errors.New("client key without its certificate")
+	case cert, ai.Token != "", ai.TokenFile != "", ai.Exec != nil, ai.AuthProvider != nil, ai.Username != "":
+		return nil
+	}
+	return errors.New("no credentials: expected a token, a client certificate or an exec plugin")
 }
 
 func Merge(cfgs []*api.Config) *api.Config {

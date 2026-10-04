@@ -93,6 +93,7 @@ type (
 	doneMsg struct {
 		status string
 		err    error
+		added  []store.Ref // clusters to check and select once reloaded
 	}
 	checkMsg struct{ res probe.Result }
 	savedMsg struct{ err error }
@@ -123,6 +124,7 @@ type model struct {
 	status  string
 	failed  bool
 	busy    bool
+	focus   string // select this item after the next reload
 
 	checks   map[string]probe.Result // this session's and remembered ones
 	checking map[string]bool
@@ -194,6 +196,12 @@ func (m model) load() tea.Cmd {
 
 // mutate runs a regular kx command with its output captured for the status line.
 func (m model) mutate(fn func(q *app.App) error) (tea.Model, tea.Cmd) {
+	return m.change(func(q *app.App) ([]store.Ref, error) { return nil, fn(q) })
+}
+
+// change is mutate for commands that add clusters: those get checked and
+// selected once the tree reloads.
+func (m model) change(fn func(q *app.App) ([]store.Ref, error)) (tea.Model, tea.Cmd) {
 	if m.busy {
 		return m, nil
 	}
@@ -203,8 +211,8 @@ func (m model) mutate(fn func(q *app.App) error) (tea.Model, tea.Cmd) {
 		var out bytes.Buffer
 		q := *a
 		q.Stdin, q.Stdout, q.Stderr = strings.NewReader(""), &out, io.Discard
-		err := fn(&q)
-		return doneMsg{status: summarize(out.String()), err: err}
+		added, err := fn(&q)
+		return doneMsg{status: summarize(out.String()), err: err, added: added}
 	}
 }
 
@@ -256,6 +264,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			break
 		}
 		sel := m.selected()
+		if m.focus != "" {
+			sel, m.focus = m.focus, ""
+		}
 		m.rows, m.st, m.foreign = msg.rows, msg.st, msg.foreign
 		for ctx, res := range msg.checks {
 			if _, have := m.checks[ctx]; !have {
@@ -269,7 +280,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.status, m.failed = firstLine(msg.err), true
 		}
-		return m, m.load()
+		if len(msg.added) == 0 {
+			return m, m.load()
+		}
+		m.focus = msg.added[0].String()
+		return m, tea.Batch(m.load(), m.probeRefs(msg.added))
 	case checkMsg:
 		delete(m.checking, msg.res.Context)
 		m.checks[msg.res.Context] = msg.res
@@ -447,7 +462,7 @@ func (m model) updateInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			path, data := m.addPath, m.addData
-			return m.mutate(func(q *app.App) error {
+			return m.change(func(q *app.App) ([]store.Ref, error) {
 				if data != nil {
 					q.Stdin = bytes.NewReader(data)
 					return q.Add("-", val, "", nil, false)
@@ -468,19 +483,30 @@ func (m model) updateInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) startChecks() (tea.Model, tea.Cmd) {
+	var refs []store.Ref
+	for _, it := range m.items {
+		if it.row != nil {
+			refs = append(refs, store.Ref{Client: it.row.Client, Cluster: it.row.Cluster})
+		}
+	}
+	return m, m.probeRefs(refs)
+}
+
+// probeRefs starts checks for the clusters not being checked already.
+func (m model) probeRefs(refs []store.Ref) tea.Cmd {
 	ticking := len(m.checking) > 0
 	var cmds []tea.Cmd
-	for _, it := range m.items {
-		if it.row == nil || m.checking[it.row.Context] {
+	for _, r := range refs {
+		if m.checking[r.String()] {
 			continue
 		}
-		m.checking[it.row.Context] = true
-		cmds = append(cmds, m.probeCmd(store.Ref{Client: it.row.Client, Cluster: it.row.Cluster}))
+		m.checking[r.String()] = true
+		cmds = append(cmds, m.probeCmd(r))
 	}
 	if len(cmds) > 0 && !ticking {
 		cmds = append(cmds, m.spin.Tick)
 	}
-	return m, tea.Batch(cmds...)
+	return tea.Batch(cmds...)
 }
 
 func (m model) currentClient() string {

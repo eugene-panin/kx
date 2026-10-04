@@ -20,27 +20,10 @@ func (a *App) Check(ctx context.Context, args []string, all bool, timeout time.D
 	if err != nil {
 		return err
 	}
-	results := make([]probe.Result, len(refs))
-	sem := make(chan struct{}, probe.Parallel)
-	var wg sync.WaitGroup
-	for i, r := range refs {
-		cfg, err := a.Store.Get(r)
-		if err != nil {
-			return err
-		}
-		wg.Go(func() {
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			pctx, cancel := context.WithTimeout(ctx, timeout)
-			defer cancel()
-			results[i] = probe.Probe(pctx, cfg, r.String())
-		})
+	results, err := a.probeAll(ctx, refs, timeout)
+	if err != nil {
+		return err
 	}
-	wg.Wait()
-	if err := a.SaveChecks(results); err != nil {
-		fmt.Fprintln(a.Stderr, "kx: save check results:", err)
-	}
-
 	if asJSON {
 		enc := json.NewEncoder(a.Stdout)
 		enc.SetIndent("", "  ")
@@ -56,6 +39,57 @@ func (a *App) Check(ctx context.Context, args []string, all bool, timeout time.D
 		}
 	}
 	return nil
+}
+
+// CheckAdded probes clusters that were just added and reports each on one line.
+func (a *App) CheckAdded(ctx context.Context, refs []store.Ref, timeout time.Duration) error {
+	results, err := a.probeAll(ctx, refs, timeout)
+	if err != nil {
+		return err
+	}
+	failed := false
+	for _, r := range results {
+		parts := []string{"check " + r.Context, r.Status}
+		if r.Health == "degraded" {
+			parts = append(parts, "degraded: "+strings.Join(r.Failing, ", "))
+		}
+		for _, p := range []string{r.Version, probe.ShortUser(r.User), r.Error} {
+			if p != "" {
+				parts = append(parts, p)
+			}
+		}
+		fmt.Fprintln(a.Stdout, strings.Join(parts, "  "))
+		failed = failed || r.Failed()
+	}
+	if failed {
+		return ExitError(1)
+	}
+	return nil
+}
+
+// probeAll checks refs in parallel and remembers the results.
+func (a *App) probeAll(ctx context.Context, refs []store.Ref, timeout time.Duration) ([]probe.Result, error) {
+	results := make([]probe.Result, len(refs))
+	sem := make(chan struct{}, probe.Parallel)
+	var wg sync.WaitGroup
+	for i, r := range refs {
+		cfg, err := a.Store.Get(r)
+		if err != nil {
+			return nil, err
+		}
+		wg.Go(func() {
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			pctx, cancel := context.WithTimeout(ctx, timeout)
+			defer cancel()
+			results[i] = probe.Probe(pctx, cfg, r.String())
+		})
+	}
+	wg.Wait()
+	if err := a.SaveChecks(results); err != nil {
+		fmt.Fprintln(a.Stderr, "kx: save check results:", err)
+	}
+	return results, nil
 }
 
 // checkTargets picks explicitly named clusters (disabled ones included), all

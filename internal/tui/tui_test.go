@@ -94,7 +94,7 @@ func (e *env) ok(args ...string) {
 	}
 	switch args[0] {
 	case "add":
-		err = a.Add(args[1], flag("-c"), flag("-n"), nil, false)
+		_, err = a.Add(args[1], flag("-c"), flag("-n"), nil, false)
 	case "rm":
 		err = a.Remove(args[1:2], true)
 	case "check":
@@ -271,6 +271,30 @@ func TestTUIPaste(t *testing.T) {
 	msgs := append([]tea.Msg{keyMsg("ctrl+u")}, typed("globex")...)
 	drive(t, tm, append(msgs, keyMsg("enter"))...)
 	e.WantContexts("acme/prod", "globex/kubernetes-admin-kubernetes")
+}
+
+func TestTUIChecksAddedClusters(t *testing.T) {
+	e := newEnv(t)
+	srv := kxtest.FakeAPI(t, kxtest.APIOpts{Version: "v1.36.2"})
+	e.WriteCA(srv)
+	e.ok("add", e.Kubeconfig("a.yaml", "https://a"), "-c", "acme", "-n", "old")
+	m := newTUI(t, e, 120, 20)
+
+	msgs := append([]tea.Msg{keyMsg("a")}, typed(e.Kubeconfig("b.yaml", srv.URL))...)
+	msgs = append(msgs, keyMsg("enter"), keyMsg("ctrl+u"))
+	msgs = append(msgs, typed("globex")...)
+	m = drive(t, m, append(msgs, keyMsg("enter"))...)
+
+	if got := selectedRef(m); got != "globex/kubernetes-admin-kubernetes" {
+		t.Errorf("cursor on %q, want the added cluster", got)
+	}
+	res, ok := m.(model).checks["globex/kubernetes-admin-kubernetes"]
+	if !ok || res.Status != "ok" || res.Version != "v1.36.2" {
+		t.Errorf("added cluster was not checked: %+v", res)
+	}
+	if _, checked := m.(model).checks["acme/old"]; checked {
+		t.Error("adding one cluster checked the others too")
+	}
 }
 
 func TestTUIAddDroppedFile(t *testing.T) {

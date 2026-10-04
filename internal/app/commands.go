@@ -16,30 +16,33 @@ import (
 	"k8s.io/client-go/tools/clientcmd/api"
 )
 
-func (a *App) Add(src, client, name string, contexts []string, force bool) error {
+// Add imports the contexts of a kubeconfig (a file, or "-" for stdin) under
+// client and returns the clusters it added. Every context is validated before
+// anything is written.
+func (a *App) Add(src, client, name string, contexts []string, force bool) ([]store.Ref, error) {
 	if !store.ValidName(client) {
-		return fmt.Errorf("invalid client name %q", client)
+		return nil, fmt.Errorf("invalid client name %q", client)
 	}
 	if src != "-" {
 		if abs, err := filepath.Abs(src); err == nil && abs == a.Target {
-			return fmt.Errorf("%s is the file kx generates; use `kx import-current` to take over its contexts", src)
+			return nil, fmt.Errorf("%s is the file kx generates; use `kx import-current` to take over its contexts", src)
 		}
 	}
 	if err := a.prepare(); err != nil {
-		return err
+		return nil, err
 	}
 	cfg, err := store.ReadKubeconfig(src, a.Stdin)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if len(contexts) == 0 {
 		contexts = store.ContextNames(cfg)
 	}
 	switch {
 	case len(contexts) == 0:
-		return fmt.Errorf("%s has no contexts", src)
+		return nil, fmt.Errorf("%s has no contexts", src)
 	case name != "" && len(contexts) > 1:
-		return fmt.Errorf("--name needs exactly one context, %s has %d; pick one with --context", src, len(contexts))
+		return nil, fmt.Errorf("--name needs exactly one context, %s has %d; pick one with --context", src, len(contexts))
 	}
 
 	type item struct {
@@ -54,29 +57,34 @@ func (a *App) Add(src, client, name string, contexts []string, force bool) error
 			cluster = store.Sanitize(ctx)
 		}
 		if !store.ValidName(cluster) {
-			return fmt.Errorf("invalid cluster name %q", cluster)
+			return nil, fmt.Errorf("invalid cluster name %q", cluster)
 		}
 		r := store.Ref{Client: client, Cluster: cluster}
 		if prev, dup := seen[r]; dup {
-			return fmt.Errorf("contexts %q and %q both map to %s; add them one by one with --context and --name", prev, ctx, r)
+			return nil, fmt.Errorf("contexts %q and %q both map to %s; add them one by one with --context and --name", prev, ctx, r)
 		}
 		seen[r] = ctx
 		if !force && a.Store.Exists(r) {
-			return fmt.Errorf("%s already exists; use --force to overwrite or --name to pick another name", r)
+			return nil, fmt.Errorf("%s already exists; use --force to overwrite or --name to pick another name", r)
 		}
 		one, err := store.Extract(cfg, ctx, r.String())
 		if err != nil {
-			return err
+			return nil, err
+		}
+		if err := store.Validate(one, r.String()); err != nil {
+			return nil, fmt.Errorf("context %q: %w", ctx, err)
 		}
 		items = append(items, item{r, one})
 	}
+	var added []store.Ref
 	for _, it := range items {
 		if err := a.Store.Put(it.r, it.cfg); err != nil {
-			return err
+			return added, err
 		}
-		fmt.Fprintf(a.Stdout, "added %s\t%s\n", it.r, it.cfg.Clusters[it.r.String()].Server)
+		added = append(added, it.r)
+		fmt.Fprintf(a.Stdout, "added %s  %s\n", it.r, it.cfg.Clusters[it.r.String()].Server)
 	}
-	return a.Build(false, nil)
+	return added, a.Build(false, nil)
 }
 
 func (a *App) ImportCurrent(client string) error {

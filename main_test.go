@@ -581,3 +581,45 @@ func TestNamespace(t *testing.T) {
 		}
 	}
 }
+
+func TestAddRejectsBrokenConfigs(t *testing.T) {
+	e := newEnv(t)
+	t.Chdir(e.Src) // the fixture's ca.crt is relative
+	noCreds := strings.Replace(strings.Replace(kxtest.Kubeadm, "%s", "https://a", 1), "    token: secret\n", "    {}\n", 1)
+	noCreds = strings.Replace(noCreds, "  user:\n    {}\n", "  user: {}\n", 1)
+	out, err := e.run(noCreds, "add", "-", "-c", "acme")
+	if err == nil || !strings.Contains(err.Error(), `context "kubernetes-admin@kubernetes": no credentials`) {
+		t.Fatalf("err = %v\n%s", err, out)
+	}
+	noServer := strings.Replace(kxtest.Kubeadm, "    server: %s\n", "", 1)
+	if _, err := e.run(noServer, "add", "-", "-c", "acme"); err == nil || !strings.Contains(err.Error(), "no server address") {
+		t.Errorf("no server: err = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(e.Home, "clusters", "acme")); !os.IsNotExist(err) {
+		t.Error("a rejected config left files in the store")
+	}
+}
+
+func TestAddCheck(t *testing.T) {
+	e := newEnv(t)
+	srv := kxtest.FakeAPI(t, kxtest.APIOpts{Version: "v1.36.2"})
+	e.WriteCA(srv)
+
+	out := e.ok("add", e.Kubeconfig("a.yaml", srv.URL), "-c", "acme", "-n", "prod", "--check")
+	if !strings.Contains(out, "check acme/prod  ok  v1.36.2  kubernetes-admin") {
+		t.Errorf("add --check output:\n%s", out)
+	}
+
+	bad := strings.Replace(strings.Replace(kxtest.Kubeadm, "%s", srv.URL, 1), "token: secret", "token: wrong", 1)
+	bad = strings.Replace(bad, "certificate-authority: ca.crt", "certificate-authority: "+filepath.Join(e.Src, "ca.crt"), 1)
+	out, err := e.run(bad, "add", "-", "-c", "acme", "-n", "stale", "--check")
+	if _, isExit := err.(app.ExitError); !isExit || !strings.Contains(out, "check acme/stale  unauthorized") {
+		t.Errorf("failing check: err = %v\n%s", err, out)
+	}
+	// The cluster is added all the same, and the result is remembered.
+	e.WantContexts("acme/prod", "acme/stale")
+	checks, err := probe.LoadCache(filepath.Join(e.Home, "checks.json"))
+	if err != nil || checks["acme/stale"].Status != "unauthorized" || checks["acme/prod"].Status != "ok" {
+		t.Errorf("saved checks = %+v, %v", checks, err)
+	}
+}

@@ -75,7 +75,9 @@ kx  4 clusters · 2 clients
 
 Someone pasted a kubeconfig in chat: copy it, press `p`, type the client name.
 Someone sent a file: press `a` and drag the file from Finder into the terminal
-window. Lens picks up the new cluster on its own.
+window. kx checks the new cluster right away, so you see whether the config
+actually works while the client is still around, and Lens picks it up on its
+own.
 
 | key | what it does |
 |---|---|
@@ -98,8 +100,24 @@ Add:
 ```bash
 kx add ~/Downloads/kubeconfig.yaml -c acme
 pbpaste | kx add - -c acme --name prod
+kx add - -c acme          # paste the config into the terminal, then Ctrl-D
 kx add big.yaml -c acme --context ctx-a --context ctx-b
 ```
+
+Nothing is written until every context in the input looks usable: it needs an
+http(s) server address and some credentials (a token, a client certificate
+with its key, an exec plugin and so on). Otherwise kx says what is missing and
+in which context.
+
+Add `--check` to talk to the new clusters straight away:
+
+```
+$ pbpaste | kx add - -c acme --name prod --check
+added acme/prod  https://10.0.0.1:6443
+check acme/prod  ok  v1.36.2  kubernetes-admin
+```
+
+If the check fails the cluster stays added and the exit code is 1.
 
 If the file has several contexts, all of them are added and named after the
 original contexts (for EKS only the part after the last `/` is kept).

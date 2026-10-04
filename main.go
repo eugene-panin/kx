@@ -84,22 +84,28 @@ Clusters are addressed as <client>/<cluster>.`,
 		client, name string
 		contexts     []string
 		force        bool
+		checkAdded   bool
 	)
 	add := &cobra.Command{
 		Use:   "add <kubeconfig|-> -c <client>",
 		Short: "Import clusters from a kubeconfig file or stdin",
 		Example: `  kx add ~/Downloads/kubeconfig.yaml -c acme
-  pbpaste | kx add - -c acme --name prod
+  pbpaste | kx add - -c acme --name prod --check
   kx add big.yaml -c acme --context ctx-a --context ctx-b`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return a.Add(args[0], client, name, contexts, force)
+			added, err := a.Add(args[0], client, name, contexts, force)
+			if err != nil || !checkAdded {
+				return err
+			}
+			return a.CheckAdded(cmd.Context(), added, probe.Timeout)
 		},
 	}
 	add.Flags().StringVarP(&client, "client", "c", "", "client the clusters belong to (required)")
 	add.Flags().StringVarP(&name, "name", "n", "", "cluster name (single context only)")
 	add.Flags().StringArrayVar(&contexts, "context", nil, "import only this context (repeatable)")
 	add.Flags().BoolVarP(&force, "force", "f", false, "overwrite existing clusters")
+	add.Flags().BoolVar(&checkAdded, "check", false, "check the added clusters right away; exit 1 if a check fails")
 	add.MarkFlagRequired("client")
 
 	var importClient string

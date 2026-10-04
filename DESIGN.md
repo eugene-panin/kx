@@ -41,7 +41,7 @@ generated file.
 ## Commands
 
 ```
-kx add <file|-> -c <client> [--name N] [--context C]... [--force]
+kx add <file|-> -c <client> [--name N] [--context C]... [--force] [--check]
 kx ls [client] [--json]
 kx use [client/cluster]
 kx ns [client/cluster] [namespace]
@@ -58,7 +58,7 @@ kx build [--force]
 
 | command | what it does |
 |---|---|
-| `add` | Splits the input kubeconfig into contexts, renames them to `client/<name>`, inlines files and puts them in the store. `--context` takes only the named ones. `--name` sets the cluster name (single context only). By default the name is the original context name, sanitized (for an EKS ARN, the part after the last `/`). `--force` overwrites an existing cluster. |
+| `add` | Splits the input kubeconfig into contexts, renames them to `client/<name>`, inlines files and puts them in the store. `--context` takes only the named ones. `--name` sets the cluster name (single context only). By default the name is the original context name, sanitized (for an EKS ARN, the part after the last `/`). `--force` overwrites an existing cluster. Before anything is written, every context must have an http(s) server address and credentials (token, token file, client certificate with key, exec or auth-provider plugin, basic auth); otherwise the whole add fails and says what is missing. `--check` probes the added clusters right after (like `check`, one line each) and exits 1 if a check fails; the clusters stay added. |
 | `ls` | Table of `CLIENT CLUSTER SERVER NAMESPACE VERSION STATE`, `*` marks the current context. VERSION comes from the last check. `--json` for scripts and agents, no credentials. |
 | `use` | Sets `current-context`, the cluster kubectl, helm and k9s talk to by default. Without an argument prints the current one. Only that one field is rewritten, with no rebuild and no backup, so switching back and forth doesn't push useful backups out. A cluster that is off can't be made current; turning off or removing the current cluster clears `current-context`. |
 | `ns` | Prints or sets the default namespace: of the current context, or of the named cluster (even one that is off). Written to the target and to the store, rewriting only that field, with no rebuild and no backup. The name is checked against Kubernetes rules (DNS-1123 label) but not looked up in the cluster, so it works offline. |
@@ -121,6 +121,8 @@ The main use case is "someone sent a config, I drop it in, Lens picks it up":
   pasted in chat goes in with two key presses.
 - `a` reads a kubeconfig from a file. The file can be dragged from Finder into
   the terminal: quotes and escaped spaces in the path are handled.
+- After `p` or `a` the new clusters are checked right away and the cursor
+  moves to the first one.
 - `enter` makes a cluster current (`current-context`, marked `*`), `n` sets
   its default namespace.
 - `space` turns a cluster or a whole client on or off, `r` renames, `d`
